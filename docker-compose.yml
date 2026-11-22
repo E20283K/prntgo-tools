@@ -1,0 +1,35 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - WEB_PASSWORD=${WEB_PASSWORD:-}
+      - SECRET_KEY=${SECRET_KEY:-}
+      - PUBLIC_URL=${PUBLIC_URL:-}
+      - JOB_TTL_HOURS=${JOB_TTL_HOURS:-24}
+    volumes:
+      - printhub_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  bot:
+    build: .
+    restart: on-failure
+    command: ["python", "-m", "bot.main"]
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - ALLOWED_TELEGRAM_IDS=${ALLOWED_TELEGRAM_IDS:-}
+      - PUBLIC_URL=${PUBLIC_URL:-}
+      - JOB_TTL_HOURS=${JOB_TTL_HOURS:-24}
+    volumes:
+      - printhub_data:/app/data
+    depends_on:
+      - web
+
+volumes:
+  printhub_data:
