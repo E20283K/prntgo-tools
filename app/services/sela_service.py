@@ -159,11 +159,17 @@ def preview_static_set_pdf(filename: str) -> bytes:
     return _cached_static_set_pdf(str(fp), fp.stat().st_mtime_ns)
 
 
+@lru_cache(maxsize=64)
+def _cached_static_set_png(file_path_str: str, mtime_ns: int, dpi: int) -> bytes:
+    del mtime_ns  # cache key invalidation
+    return gl.render_static_label_preview_png(Path(file_path_str), dpi=dpi)
+
+
 def preview_static_set_png(filename: str, dpi: int = 150) -> bytes:
     fp = SELA_SET_DIR / Path(filename).name
     if not fp.is_file():
         raise FileNotFoundError(f"Set fayli topilmadi: {filename}")
-    return gl.render_static_label_preview_png(fp, dpi=dpi)
+    return _cached_static_set_png(str(fp), fp.stat().st_mtime_ns, dpi)
 
 
 def render_pdf_first_page_png(pdf_path: Path, dpi: int = 120) -> bytes:

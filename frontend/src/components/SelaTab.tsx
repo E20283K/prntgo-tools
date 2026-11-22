@@ -67,6 +67,7 @@ import { PdfPreview } from "@/components/PdfPreview"
 import {
   apiFetch,
   jobFileUrl,
+  selaSetPreviewImgUrl,
   selaSetPreviewUrl,
   type LabelHandoff,
   type SelaConfigResponse,
@@ -717,12 +718,12 @@ export function SelaTab({ ready, onSendToLabelImp }: SelaTabProps) {
                         <ZoomIn className="size-3.5" />
                       </button>
                     </div>
-                    <div className="overflow-hidden rounded-md border bg-white">
-                      <iframe
-                        src={`${selaSetPreviewUrl(item.name)}#toolbar=0&navpanes=0&scrollbar=0&view=Fit`}
-                        title={item.label}
+                    <div className="overflow-hidden rounded-md border bg-white p-1">
+                      <img
+                        src={selaSetPreviewImgUrl(item.name, 150)}
+                        alt={item.label}
                         loading="lazy"
-                        className="pointer-events-none block h-[84px] w-full border-0 bg-white"
+                        className="pointer-events-none block h-[80px] w-full object-contain bg-white"
                       />
                     </div>
                   </div>
@@ -829,13 +830,13 @@ export function SelaTab({ ready, onSendToLabelImp }: SelaTabProps) {
                       {files.map((fn) => (
                         <div
                           key={fn}
-                          className="overflow-hidden rounded-md border bg-white"
+                          className="overflow-hidden rounded-md border bg-white p-1"
                         >
-                          <iframe
-                            src={`${selaSetPreviewUrl(fn)}#toolbar=0&navpanes=0&scrollbar=0&view=Fit`}
-                            title={fn}
+                          <img
+                            src={selaSetPreviewImgUrl(fn, 150)}
+                            alt={fn}
                             loading="lazy"
-                            className="pointer-events-none block h-[76px] w-full border-0 bg-white"
+                            className="pointer-events-none block h-[72px] w-full object-contain bg-white"
                           />
                         </div>
                       ))}
@@ -994,13 +995,32 @@ export function SelaTab({ ready, onSendToLabelImp }: SelaTabProps) {
           </DialogHeader>
           <div className="max-h-[75vh] space-y-3 overflow-y-auto pr-1">
             {zoomPreview?.files.map((fn) => (
-              <PdfPreview
+              <div
                 key={fn}
-                src={selaSetPreviewUrl(fn)}
-                title={fn}
-                showToolbar
-                iframeClassName="h-[260px]"
-              />
+                className="overflow-hidden rounded-lg border bg-card"
+              >
+                <div className="flex items-center justify-between gap-2 border-b bg-muted/40 px-3 py-1.5 text-xs">
+                  <span className="truncate font-medium text-muted-foreground">
+                    {fn}
+                  </span>
+                  <a
+                    href={selaSetPreviewUrl(fn)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-primary hover:underline"
+                  >
+                    <ExternalLink className="size-3" />
+                    PDF ochish
+                  </a>
+                </div>
+                <div className="flex items-center justify-center bg-white p-3">
+                  <img
+                    src={selaSetPreviewImgUrl(fn, 260)}
+                    alt={fn}
+                    className="max-h-[260px] w-full object-contain"
+                  />
+                </div>
+              </div>
             ))}
           </div>
         </DialogContent>

@@ -195,3 +195,7 @@ export function jobFileUrl(
 export function selaSetPreviewUrl(filename: string): string {
   return `/api/sela/set-preview/${encodeURIComponent(filename)}`
 }
+
+export function selaSetPreviewImgUrl(filename: string, dpi = 150): string {
+  return `/api/sela/set-preview/${encodeURIComponent(filename)}?format=png&dpi=${dpi}`
+}

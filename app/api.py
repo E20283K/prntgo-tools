@@ -196,10 +196,24 @@ def sela_preview(
 
 
 @app.get("/api/sela/set-preview/{filename}", dependencies=[Depends(require_auth)])
-def sela_set_preview(filename: str) -> Response:
+def sela_set_preview(
+    filename: str,
+    format: str = Query("pdf"),
+    dpi: int = Query(150, ge=72, le=300),
+) -> Response:
     try:
-        pdf_bytes = sela_service.preview_static_set_pdf(filename)
         safe_stem = Path(filename).stem
+        if format.lower() == "png":
+            png_bytes = sela_service.preview_static_set_png(filename, dpi=dpi)
+            return Response(
+                content=png_bytes,
+                media_type="image/png",
+                headers={
+                    "Content-Disposition": f'inline; filename="{safe_stem}.png"',
+                    "Cache-Control": "private, max-age=86400",
+                },
+            )
+        pdf_bytes = sela_service.preview_static_set_pdf(filename)
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
