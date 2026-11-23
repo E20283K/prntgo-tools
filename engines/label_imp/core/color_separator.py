@@ -247,7 +247,7 @@ def _extract_colors_from_stream_bytes(
                     colors.append(rgb)
             elif op in ("sc", "SC", "scn", "SCN"):
                 num_ops = [float(x) for x in operands if _is_number(x)]
-                if active_cs in spot_map or (len(num_ops) == 1 and active_cs not in ("/DeviceGray", "/DefaultGray")):
+                if active_cs in spot_map:
                     tint = num_ops[-1] if num_ops else 1.0
                     if tint > 0.02:
                         rgb = spot_map.get(active_cs) or (0.0, 0.0, 0.0)
@@ -462,7 +462,7 @@ def _filter_and_monochromize_stream(
             is_stroke = op in ("SC", "SCN")
             cur_cs = active_cs_stroke if is_stroke else active_cs_nonstroke
 
-            if cur_cs in spot_map or (len(num_ops) == 1 and cur_cs not in ("/DeviceGray", "/DefaultGray")):
+            if cur_cs in spot_map:
                 tint = num_ops[-1] if num_ops else 1.0
                 if tint > 0.02:
                     c_rgb = spot_map.get(cur_cs) or (0.0, 0.0, 0.0)
