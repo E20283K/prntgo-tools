@@ -13,10 +13,11 @@ __pycache__
 .venv
 venv
 
-# Frontend local artifacts (built fresh in Docker Stage 1)
-frontend/node_modules
-frontend/dist
-app/static
+# Frontend source & node_modules (pre-built bundle is in app/static)
+frontend
 
-# Local runtime job outputs (never bake into image)
+# Local runtime job outputs & local Claude/VectorCraft data (never bake into image)
 data/jobs
+data/claude_home
+data/claude_workspace
+data/vectorcraft_web
