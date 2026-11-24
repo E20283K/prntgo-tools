@@ -391,7 +391,7 @@ export function ClaudeTerminal({
   return (
     <div className="grid gap-4 lg:grid-cols-12">
       {/* LEFT / MAIN: Live Interactive Claude Code Terminal */}
-      <div className="space-y-3 lg:col-span-8">
+      <div className="min-w-0 space-y-3 lg:col-span-8">
         <Card className="overflow-hidden border-slate-800 bg-[#090d16] text-slate-100">
           {/* Terminal Top Control Bar */}
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 bg-slate-900/90 px-3 py-2">
@@ -498,7 +498,7 @@ export function ClaudeTerminal({
               </div>
             </div>
 
-            <div className="flex items-center gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
               {/* Upload File / Screenshot into @uploads/ */}
               <label className="cursor-pointer">
                 <input
@@ -626,7 +626,7 @@ export function ClaudeTerminal({
       </div>
 
       {/* RIGHT: Live Workspace Outputs (`outputs/*.vectorcraft` & `*.pdf`) */}
-      <div className="space-y-4 lg:col-span-4">
+      <div className="min-w-0 space-y-4 lg:col-span-4">
         <Card>
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between gap-2">

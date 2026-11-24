@@ -1051,6 +1051,59 @@ async def ai_design_generate(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/api/ai-design/generate/start", dependencies=[Depends(require_auth)])
+async def ai_design_generate_start(
+    prompt: str = Form(...),
+    skill_slugs_json: Optional[str] = Form(None),
+    asset_names_json: Optional[str] = Form(None),
+    width_mm: Optional[str] = Form(None),
+    height_mm: Optional[str] = Form(None),
+    output_basename: str = Form("design"),
+    source_job_id: Optional[str] = Form(None),
+    source_filename: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None),
+) -> Dict[str, Any]:
+    """Start generation in the background; poll /generate/runs/{run_id} for live logs."""
+    try:
+        if not prompt.strip():
+            raise ValueError("Dizayn topshirig'ini (prompt) kiriting.")
+        uploaded_files: List[tuple[str, bytes]] = []
+        for f in (files or []):
+            if f.filename:
+                uploaded_files.append((f.filename, await f.read()))
+        return claude_design_service.start_ai_design_run(
+            prompt=prompt,
+            skill_slugs=json.loads(skill_slugs_json) if skill_slugs_json else [],
+            asset_names=json.loads(asset_names_json) if asset_names_json else [],
+            width_mm=float(width_mm) if (width_mm and width_mm.strip()) else None,
+            height_mm=float(height_mm) if (height_mm and height_mm.strip()) else None,
+            output_basename=output_basename,
+            uploaded_files=uploaded_files,
+            source_job_id=source_job_id,
+            source_filename=source_filename,
+            model=model,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/ai-design/generate/runs/{run_id}", dependencies=[Depends(require_auth)])
+def ai_design_generate_status(run_id: str, since: int = Query(0, ge=0)) -> Dict[str, Any]:
+    try:
+        return claude_design_service.get_ai_design_run(run_id, since)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e).strip("'\""))
+
+
+@app.post("/api/ai-design/generate/runs/{run_id}/cancel", dependencies=[Depends(require_auth)])
+def ai_design_generate_cancel(run_id: str) -> Dict[str, Any]:
+    try:
+        return claude_design_service.cancel_ai_design_run(run_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e).strip("'\""))
+
+
 @app.post("/api/ai-design/editor-export", dependencies=[Depends(require_auth)])
 async def ai_design_editor_export(
     file: UploadFile = File(...),

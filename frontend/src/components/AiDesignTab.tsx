@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ClipboardEvent,
+} from "react"
 import {
   BookOpen,
   Bot,
@@ -18,6 +24,7 @@ import {
   RefreshCw,
   Save,
   Sparkles,
+  Square,
   TerminalSquare,
   Trash2,
   Upload,
@@ -56,6 +63,56 @@ import {
   type PrintHandoff,
   type VectorCraftHandoff,
 } from "@/lib/api"
+
+type AiDesignRunStatus = "running" | "done" | "error" | "cancelled"
+
+interface AiDesignRunLog {
+  seq: number
+  t: number
+  kind:
+    | "info"
+    | "assistant"
+    | "thinking"
+    | "tool"
+    | "tool_result"
+    | "error"
+    | "success"
+    | "raw"
+  text: string
+}
+
+interface AiDesignRunSnapshot {
+  run_id: string
+  status: AiDesignRunStatus
+  job_id: string | null
+  elapsed_sec: number
+  logs: AiDesignRunLog[]
+  next: number
+  result: AiDesignGenerateResponse | null
+  error: string | null
+}
+
+const LOG_KIND_STYLE: Record<AiDesignRunLog["kind"], string> = {
+  info: "text-sky-300",
+  assistant: "text-zinc-100",
+  thinking: "text-zinc-500 italic",
+  tool: "text-amber-300",
+  tool_result: "text-zinc-400",
+  error: "text-red-400",
+  success: "text-emerald-400 font-medium",
+  raw: "text-zinc-500",
+}
+
+const LOG_KIND_PREFIX: Record<AiDesignRunLog["kind"], string> = {
+  info: "•",
+  assistant: "Claude:",
+  thinking: "…",
+  tool: "→",
+  tool_result: "←",
+  error: "✕",
+  success: "✓",
+  raw: " ",
+}
 
 interface AiDesignTabProps {
   ready: boolean
@@ -121,9 +178,70 @@ export function AiDesignTab({
   const [selectedSkills, setSelectedSkills] = useState<string[]>([])
   const [selectedAssets, setSelectedAssets] = useState<string[]>([])
   const [inputFiles, setInputFiles] = useState<File[]>([])
+  const [dragOver, setDragOver] = useState(false)
+
+  const addInputFiles = useCallback((files: File[], source: string) => {
+    if (files.length === 0) return
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:T]/g, "")
+      .slice(0, 14)
+    const normalized = files.map((f, i) => {
+      // Clipboard images usually come as "image.png" — give them unique names
+      if (!f.name || /^image\.(png|jpe?g|gif|webp|bmp)$/i.test(f.name)) {
+        const ext = (f.type.split("/")[1] || "png").replace("jpeg", "jpg")
+        return new File([f], `pasted-${stamp}-${i + 1}.${ext}`, {
+          type: f.type,
+          lastModified: Date.now(),
+        })
+      }
+      return f
+    })
+    setInputFiles((prev) => {
+      const key = (f: File) => `${f.name}:${f.size}`
+      const existing = new Set(prev.map(key))
+      return [...prev, ...normalized.filter((f) => !existing.has(key(f)))]
+    })
+    toast.success(`${normalized.length} ta fayl biriktirildi (${source})`)
+  }, [])
+
+  const handlePasteFiles = useCallback(
+    (e: ClipboardEvent) => {
+      const items = Array.from(e.clipboardData?.items ?? [])
+      const files = items
+        .filter((it) => it.kind === "file")
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => !!f)
+      if (files.length === 0) return // plain text paste — leave as is
+      e.preventDefault()
+      addInputFiles(files, "bufer")
+    },
+    [addInputFiles]
+  )
+
+  function removeInputFile(index: number) {
+    setInputFiles((prev) => prev.filter((_, i) => i !== index))
+  }
   const [sourceJobId, setSourceJobId] = useState<string | null>(null)
   const [sourceFilename, setSourceFilename] = useState<string | null>(null)
   const [generating, setGenerating] = useState(false)
+  const [stopping, setStopping] = useState(false)
+  const [runId, setRunId] = useState<string | null>(null)
+  const [runStatus, setRunStatus] = useState<AiDesignRunStatus | null>(null)
+  const [runLogs, setRunLogs] = useState<AiDesignRunLog[]>([])
+  const [runElapsed, setRunElapsed] = useState(0)
+  const pollTokenRef = useRef(0)
+  const logBoxRef = useRef<HTMLDivElement>(null)
+  const logStickRef = useRef(true)
+
+  // Stop polling when the component unmounts
+  useEffect(() => () => void (pollTokenRef.current += 1), [])
+
+  // Auto-scroll the live log to the bottom unless the user scrolled up
+  useEffect(() => {
+    const el = logBoxRef.current
+    if (el && logStickRef.current) el.scrollTop = el.scrollHeight
+  }, [runLogs])
   const [result, setResult] = useState<AiDesignGenerateResponse | null>(null)
 
   // Claude Auth & Login state
@@ -426,7 +544,13 @@ export function AiDesignTab({
       toast.error("Dizayn topshirig'ini kiriting.")
       return
     }
+    const myToken = ++pollTokenRef.current
     setGenerating(true)
+    setStopping(false)
+    setRunLogs([])
+    setRunElapsed(0)
+    setRunStatus("running")
+    setRunId(null)
     try {
       const fd = new FormData()
       fd.append("prompt", prompt.trim())
@@ -441,19 +565,74 @@ export function AiDesignTab({
       }
       inputFiles.forEach((f) => fd.append("files", f))
 
-      const res = await apiFetch("/api/ai-design/generate", {
+      const startRes = await apiFetch("/api/ai-design/generate/start", {
         method: "POST",
         body: fd,
       })
-      const data: AiDesignGenerateResponse = await res.json()
-      setResult(data)
-      toast.success("Dizayn muvaffaqiyatli generatsiya qilindi!")
+      const { run_id } = (await startRes.json()) as { run_id: string }
+      setRunId(run_id)
+
+      // Poll live logs until the run finishes
+      let since = 0
+      let failures = 0
+      while (pollTokenRef.current === myToken) {
+        await new Promise((r) => setTimeout(r, 1000))
+        if (pollTokenRef.current !== myToken) return
+        let snap: AiDesignRunSnapshot
+        try {
+          const res = await apiFetch(
+            `/api/ai-design/generate/runs/${encodeURIComponent(run_id)}?since=${since}`
+          )
+          snap = await res.json()
+          failures = 0
+        } catch (err) {
+          if (++failures >= 5) throw err
+          continue
+        }
+        if (snap.logs.length > 0) {
+          setRunLogs((prev) => [...prev, ...snap.logs].slice(-3000))
+        }
+        since = snap.next
+        setRunElapsed(snap.elapsed_sec)
+        setRunStatus(snap.status)
+
+        if (snap.status === "done" && snap.result) {
+          setResult(snap.result)
+          toast.success("Dizayn muvaffaqiyatli generatsiya qilindi!")
+          break
+        }
+        if (snap.status === "cancelled") {
+          toast.info("Generatsiya to'xtatildi.")
+          break
+        }
+        if (snap.status === "error") {
+          throw new Error(snap.error || "Dizayn generatsiyasida xatolik")
+        }
+      }
     } catch (err) {
+      setRunStatus("error")
       toast.error(
         err instanceof Error ? err.message : "Dizayn generatsiyasida xatolik"
       )
     } finally {
-      setGenerating(false)
+      if (pollTokenRef.current === myToken) {
+        setGenerating(false)
+        setStopping(false)
+      }
+    }
+  }
+
+  async function handleStopGeneration() {
+    if (!runId) return
+    setStopping(true)
+    try {
+      await apiFetch(
+        `/api/ai-design/generate/runs/${encodeURIComponent(runId)}/cancel`,
+        { method: "POST" }
+      )
+    } catch (err) {
+      setStopping(false)
+      toast.error(err instanceof Error ? err.message : "To'xtatishda xato")
     }
   }
 
@@ -502,14 +681,16 @@ export function AiDesignTab({
 
           <Badge
             variant={status?.auth.authenticated ? "default" : "secondary"}
-            className="gap-1.5"
+            className="max-w-full gap-1.5"
           >
             {status?.auth.authenticated ? (
-              <CheckCircle2 className="size-3.5 text-emerald-400" />
+              <CheckCircle2 className="size-3.5 shrink-0 text-emerald-400" />
             ) : (
-              <XCircle className="size-3.5 text-amber-400" />
+              <XCircle className="size-3.5 shrink-0 text-amber-400" />
             )}
-            Obuna: {status?.auth.account_info ?? "Tekshirilmoqda..."}
+            <span className="truncate">
+              Obuna: {status?.auth.account_info ?? "Tekshirilmoqda..."}
+            </span>
           </Badge>
 
           <Badge
@@ -552,16 +733,25 @@ export function AiDesignTab({
       </div>
 
       <Tabs value={subTab} onValueChange={setSubTab}>
-        <TabsList className="grid w-full max-w-2xl grid-cols-3">
-          <TabsTrigger value="terminal" className="gap-1.5">
+        <TabsList className="grid w-full max-w-2xl grid-cols-1 gap-1 group-data-horizontal/tabs:h-auto sm:grid-cols-3 sm:gap-0 sm:group-data-horizontal/tabs:h-9">
+          <TabsTrigger
+            value="terminal"
+            className="h-auto justify-start gap-1.5 px-2.5 py-1.5 sm:h-[calc(100%-1px)] sm:justify-center sm:px-2 sm:py-0.5"
+          >
             <TerminalSquare className="size-4" />
             Claude Code Terminal
           </TabsTrigger>
-          <TabsTrigger value="studio" className="gap-1.5">
+          <TabsTrigger
+            value="studio"
+            className="h-auto justify-start gap-1.5 px-2.5 py-1.5 sm:h-[calc(100%-1px)] sm:justify-center sm:px-2 sm:py-0.5"
+          >
             <Sparkles className="size-4" />
             Tezkor Forma Generator
           </TabsTrigger>
-          <TabsTrigger value="settings" className="gap-1.5">
+          <TabsTrigger
+            value="settings"
+            className="h-auto justify-start gap-1.5 px-2.5 py-1.5 sm:h-[calc(100%-1px)] sm:justify-center sm:px-2 sm:py-0.5"
+          >
             <Wrench className="size-4" />
             Skills, Fayllar & Login
           </TabsTrigger>
@@ -607,7 +797,7 @@ export function AiDesignTab({
 
           <div className="grid gap-6 lg:grid-cols-12">
             {/* LEFT COLUMN: Prompt, Dimensions, Skills & Assets selector */}
-            <Card className="lg:col-span-5">
+            <Card className="lg:col-span-5" onPaste={handlePasteFiles}>
               <CardHeader className="pb-3">
                 <CardTitle className="flex items-center gap-2 text-base">
                   <Sparkles className="size-4 text-primary" />
@@ -814,37 +1004,191 @@ export function AiDesignTab({
                     id="ai-files"
                     type="file"
                     multiple
-                    onChange={(e) =>
-                      setInputFiles(
-                        e.target.files ? Array.from(e.target.files) : []
+                    onChange={(e) => {
+                      addInputFiles(
+                        e.target.files ? Array.from(e.target.files) : [],
+                        "tanlash"
                       )
-                    }
+                      e.target.value = ""
+                    }}
                   />
+                  <div
+                    tabIndex={0}
+                    role="button"
+                    aria-label="Fayllarni bu yerga Ctrl+V bilan joylang yoki sudrab tashlang"
+                    onClick={(e) => e.currentTarget.focus()}
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      setDragOver(true)
+                    }}
+                    onDragLeave={() => setDragOver(false)}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      setDragOver(false)
+                      addInputFiles(
+                        Array.from(e.dataTransfer.files ?? []),
+                        "sudrash"
+                      )
+                    }}
+                    className={`flex cursor-text items-center justify-center gap-2 rounded-lg border border-dashed px-3 py-3 text-center text-xs text-muted-foreground outline-none transition-colors focus:border-primary focus:bg-primary/5 focus:text-foreground ${
+                      dragOver ? "border-primary bg-primary/5 text-foreground" : ""
+                    }`}
+                  >
+                    <Upload className="size-3.5 shrink-0" />
+                    <span>
+                      Bu yerni bosib <kbd className="rounded border bg-muted px-1 font-mono">Ctrl</kbd>+
+                      <kbd className="rounded border bg-muted px-1 font-mono">V</kbd> bilan
+                      buferdan joylang yoki faylni sudrab tashlang
+                    </span>
+                  </div>
+                  {inputFiles.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      {inputFiles.map((f, i) => (
+                        <Badge
+                          key={`${f.name}-${f.size}-${i}`}
+                          variant="secondary"
+                          className="gap-1 pr-1"
+                        >
+                          {f.name} ({Math.max(1, Math.round(f.size / 1024))} KB)
+                          <button
+                            type="button"
+                            className="rounded-sm p-0.5 hover:bg-destructive/20 hover:text-destructive"
+                            onClick={() => removeInputFile(i)}
+                            aria-label={`${f.name} ni olib tashlash`}
+                          >
+                            <XCircle className="size-3" />
+                          </button>
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
-                <Button
-                  className="w-full gap-2"
-                  onClick={() => void handleGenerateDesign()}
-                  disabled={generating}
-                >
-                  {generating ? (
-                    <>
-                      <Loader2 className="size-4 animate-spin" />
-                      Claude Code + VectorCraft ishlamoqda...
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="size-4" />
-                      Dizaynni Generatsiya Qilish (.vectorcraft + .pdf)
-                    </>
+                <div className="flex gap-2">
+                  <Button
+                    className="flex-1 gap-2"
+                    onClick={() => void handleGenerateDesign()}
+                    disabled={generating}
+                  >
+                    {generating ? (
+                      <>
+                        <Loader2 className="size-4 animate-spin" />
+                        Ishlamoqda... {Math.round(runElapsed)} s
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="size-4" />
+                        Dizaynni Generatsiya Qilish (.vectorcraft + .pdf)
+                      </>
+                    )}
+                  </Button>
+                  {generating && (
+                    <Button
+                      variant="destructive"
+                      className="gap-2"
+                      onClick={() => void handleStopGeneration()}
+                      disabled={!runId || stopping}
+                    >
+                      {stopping ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <Square className="size-4 fill-current" />
+                      )}
+                      {stopping ? "To'xtatilmoqda..." : "To'xtatish"}
+                    </Button>
                   )}
-                </Button>
+                </div>
               </CardContent>
             </Card>
 
             {/* RIGHT COLUMN: Generated Outputs, Preview & Handoffs */}
             <div className="space-y-4 lg:col-span-7">
+              {(generating || runLogs.length > 0) && (
+                <Card>
+                  <CardHeader className="pb-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <CardTitle className="flex items-center gap-2 text-sm">
+                        <TerminalSquare className="size-4" />
+                        Jarayon logi (real vaqt)
+                      </CardTitle>
+                      <div className="flex items-center gap-2">
+                        {runStatus && (
+                          <Badge
+                            variant={
+                              runStatus === "error"
+                                ? "destructive"
+                                : runStatus === "running"
+                                  ? "default"
+                                  : "secondary"
+                            }
+                            className="gap-1"
+                          >
+                            {runStatus === "running" && (
+                              <Loader2 className="size-3 animate-spin" />
+                            )}
+                            {
+                              {
+                                running: "Ishlamoqda",
+                                done: "Tayyor",
+                                error: "Xato",
+                                cancelled: "To'xtatildi",
+                              }[runStatus]
+                            }{" "}
+                            · {Math.round(runElapsed)} s
+                          </Badge>
+                        )}
+                        {!generating && runLogs.length > 0 && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 px-2 text-xs"
+                            onClick={() => {
+                              setRunLogs([])
+                              setRunStatus(null)
+                            }}
+                          >
+                            Tozalash
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  </CardHeader>
+                  <CardContent>
+                    <div
+                      ref={logBoxRef}
+                      onScroll={(e) => {
+                        const el = e.currentTarget
+                        logStickRef.current =
+                          el.scrollHeight - el.scrollTop - el.clientHeight < 40
+                      }}
+                      className="h-72 overflow-y-auto rounded-lg bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed"
+                    >
+                      {runLogs.length === 0 ? (
+                        <div className="text-zinc-500">
+                          Claude Code ishga tushirilmoqda...
+                        </div>
+                      ) : (
+                        runLogs.map((l) => (
+                          <div
+                            key={l.seq}
+                            className={`whitespace-pre-wrap break-words ${LOG_KIND_STYLE[l.kind] ?? "text-zinc-300"}`}
+                          >
+                            <span className="mr-2 select-none text-zinc-600">
+                              {l.t.toFixed(1).padStart(6, " ")}s
+                            </span>
+                            <span className="mr-1 select-none">
+                              {LOG_KIND_PREFIX[l.kind] ?? ""}
+                            </span>
+                            {l.text}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
               {!result ? (
+                generating || runLogs.length > 0 ? null : (
                 <Card className="flex min-h-[460px] flex-col items-center justify-center p-8 text-center">
                   <PenTool className="mb-3 size-10 text-muted-foreground/50" />
                   <h3 className="text-base font-medium">
@@ -857,6 +1201,7 @@ export function AiDesignTab({
                     fayllarni taqdim etadi.
                   </p>
                 </Card>
+                )
               ) : (
                 <>
                   {/* Main Download & Action Bar */}

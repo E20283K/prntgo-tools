@@ -1145,6 +1145,288 @@ def _collect_job_outputs_payload(job_id: str, out_dir: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # AI Design Generation via Claude Code CLI + VectorCraft MCP
 # ---------------------------------------------------------------------------
+AI_DESIGN_TIMEOUT_SEC = int(os.environ.get("AI_DESIGN_TIMEOUT_SEC", "600"))
+_RUN_LOG_LIMIT = 5000
+_RUN_RETENTION_SEC = 3600
+
+
+class GenerationCancelled(RuntimeError):
+    """Raised when the user stops an AI design generation."""
+
+
+class GenerationRun:
+    """In-memory state of one AI design generation: live logs, process handle, result."""
+
+    def __init__(self) -> None:
+        import uuid
+
+        self.run_id = uuid.uuid4().hex[:12]
+        self.created_at = time.time()
+        self.finished_at: Optional[float] = None
+        self.status = "running"  # running | done | error | cancelled
+        self.job_id: Optional[str] = None
+        self.result: Optional[Dict[str, Any]] = None
+        self.error: Optional[str] = None
+        self.proc: Optional[subprocess.Popen] = None
+        self.cancel_event = threading.Event()
+        self._logs: List[Dict[str, Any]] = []
+        self._dropped = 0  # number of oldest log entries discarded (keeps seq stable)
+        self._lock = threading.Lock()
+
+    def log(self, text: str, kind: str = "info") -> None:
+        text = _strip_ansi(str(text)).rstrip()
+        if not text:
+            return
+        with self._lock:
+            seq = self._dropped + len(self._logs)
+            self._logs.append({"seq": seq, "t": round(time.time() - self.created_at, 1), "kind": kind, "text": text})
+            if len(self._logs) > _RUN_LOG_LIMIT:
+                overflow = len(self._logs) - _RUN_LOG_LIMIT
+                del self._logs[:overflow]
+                self._dropped += overflow
+
+    def snapshot(self, since: int = 0) -> Dict[str, Any]:
+        with self._lock:
+            start = max(0, since - self._dropped)
+            logs = self._logs[start:]
+            next_seq = self._dropped + len(self._logs)
+        return {
+            "run_id": self.run_id,
+            "status": self.status,
+            "job_id": self.job_id,
+            "elapsed_sec": round((self.finished_at or time.time()) - self.created_at, 1),
+            "logs": logs,
+            "next": next_seq,
+            "result": self.result,
+            "error": self.error,
+        }
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+        _kill_process_tree(self.proc)
+
+
+_RUNS: Dict[str, GenerationRun] = {}
+_RUNS_LOCK = threading.Lock()
+
+
+def _kill_process_tree(proc: Optional[subprocess.Popen]) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=15,
+            )
+        else:
+            import signal
+
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception as e:  # pragma: no cover - best effort
+        logger.warning("Claude jarayonini to'xtatishda xato: %s", e)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _short(value: Any, limit: int = 300) -> str:
+    if not isinstance(value, str):
+        try:
+            value = json.dumps(value, ensure_ascii=False)
+        except Exception:
+            value = str(value)
+    value = value.replace("\r", "")
+    return value if len(value) <= limit else value[:limit] + "…"
+
+
+def _tool_result_text(content: Any) -> str:
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict):
+                if c.get("type") == "text":
+                    parts.append(str(c.get("text", "")))
+                elif c.get("type") == "image":
+                    parts.append("[rasm]")
+            else:
+                parts.append(str(c))
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def _run_claude_streaming(cmd: List[str], env: Dict[str, str], run: GenerationRun) -> Dict[str, Any]:
+    """Run `claude -p --output-format stream-json`, pushing human-readable events to run.log()."""
+    out: Dict[str, Any] = {
+        "returncode": -1,
+        "cancelled": False,
+        "timed_out": False,
+        "is_error": False,
+        "result_text": "",
+        "last_text": "",
+        "cost_usd": None,
+        "num_turns": None,
+        "raw_lines": [],
+    }
+
+    popen_kwargs: Dict[str, Any] = {}
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+
+    if run.cancel_event.is_set():
+        out["cancelled"] = True
+        return out
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(CLAUDE_WORKSPACE_DIR),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        **popen_kwargs,
+    )
+    run.proc = proc
+    if run.cancel_event.is_set():  # cancelled while starting
+        _kill_process_tree(proc)
+
+    def handle_event(obj: Dict[str, Any]) -> None:
+        etype = obj.get("type")
+        if etype == "system" and obj.get("subtype") == "init":
+            servers = obj.get("mcp_servers") or []
+            srv = ", ".join(f"{s.get('name')} ({s.get('status')})" for s in servers if isinstance(s, dict))
+            run.log(f"Sessiya boshlandi. Model: {obj.get('model', '?')}" + (f" | MCP: {srv}" if srv else ""), kind="info")
+        elif etype == "assistant":
+            for block in (obj.get("message") or {}).get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    out["last_text"] = block["text"]
+                    run.log(_short(block["text"], 4000), kind="assistant")
+                elif block.get("type") == "tool_use":
+                    name = str(block.get("name", "tool")).replace("mcp__vectorcraft__", "vectorcraft.")
+                    run.log(f"{name} {_short(block.get('input', {}), 400)}", kind="tool")
+                elif block.get("type") == "thinking" and block.get("thinking", "").strip():
+                    run.log(_short(block["thinking"], 1500), kind="thinking")
+        elif etype == "user":
+            for block in (obj.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    text = _tool_result_text(block.get("content")).strip() or "(bo'sh natija)"
+                    run.log(_short(text, 600), kind="error" if block.get("is_error") else "tool_result")
+        elif etype == "result":
+            out["result_text"] = str(obj.get("result") or "")
+            out["cost_usd"] = obj.get("total_cost_usd") or obj.get("cost_usd")
+            out["num_turns"] = obj.get("num_turns")
+            out["is_error"] = bool(obj.get("is_error")) or obj.get("subtype") not in (None, "success")
+            run.log(
+                f"Claude yakunladi ({obj.get('subtype', 'result')}), qadamlar: {out['num_turns']}",
+                kind="error" if out["is_error"] else "info",
+            )
+
+    def reader() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("{"):
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        handle_event(obj)
+                        continue
+                except Exception:
+                    pass
+            out["raw_lines"].append(line)
+            run.log(line, kind="raw")
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    deadline = time.time() + AI_DESIGN_TIMEOUT_SEC
+    while proc.poll() is None:
+        if run.cancel_event.is_set():
+            out["cancelled"] = True
+            _kill_process_tree(proc)
+            break
+        if time.time() > deadline:
+            out["timed_out"] = True
+            run.log(f"Vaqt tugadi ({AI_DESIGN_TIMEOUT_SEC} s), jarayon to'xtatilmoqda...", kind="error")
+            _kill_process_tree(proc)
+            break
+        time.sleep(0.3)
+
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    t.join(timeout=5)
+    out["returncode"] = proc.returncode if proc.returncode is not None else -1
+    if run.cancel_event.is_set():
+        out["cancelled"] = True
+    run.proc = None
+    return out
+
+
+def _cleanup_old_runs() -> None:
+    now = time.time()
+    with _RUNS_LOCK:
+        for rid in [r for r, v in _RUNS.items() if v.finished_at and now - v.finished_at > _RUN_RETENTION_SEC]:
+            _RUNS.pop(rid, None)
+
+
+def start_ai_design_run(**kwargs: Any) -> Dict[str, Any]:
+    """Start run_ai_design_job in a background thread and return its run_id immediately."""
+    _cleanup_old_runs()
+    run = GenerationRun()
+    with _RUNS_LOCK:
+        _RUNS[run.run_id] = run
+
+    def worker() -> None:
+        try:
+            run.result = run_ai_design_job(run=run, **kwargs)
+            run.status = "done"
+        except GenerationCancelled as e:
+            run.status = "cancelled"
+            run.error = str(e)
+        except Exception as e:
+            run.status = "cancelled" if run.cancel_event.is_set() else "error"
+            run.error = str(e)
+            run.log(str(e), kind="error")
+        finally:
+            run.finished_at = time.time()
+
+    threading.Thread(target=worker, daemon=True, name=f"ai-design-{run.run_id}").start()
+    return {"run_id": run.run_id, "status": run.status}
+
+
+def get_ai_design_run(run_id: str, since: int = 0) -> Dict[str, Any]:
+    run = _RUNS.get(run_id)
+    if not run:
+        raise KeyError("Generatsiya topilmadi (server qayta ishga tushgan bo'lishi mumkin).")
+    return run.snapshot(since)
+
+
+def cancel_ai_design_run(run_id: str) -> Dict[str, Any]:
+    run = _RUNS.get(run_id)
+    if not run:
+        raise KeyError("Generatsiya topilmadi.")
+    if run.status == "running":
+        run.log("To'xtatish so'rovi yuborildi...", kind="info")
+        run.cancel()
+    return {"run_id": run.run_id, "status": run.status}
+
+
 def run_ai_design_job(
     prompt: str,
     skill_slugs: Optional[List[str]] = None,
@@ -1156,11 +1438,15 @@ def run_ai_design_job(
     source_job_id: Optional[str] = None,
     source_filename: Optional[str] = None,
     model: Optional[str] = None,
+    run: Optional["GenerationRun"] = None,
 ) -> Dict[str, Any]:
     """
     Execute Claude Code headlessly with VectorCraft MCP and workspace Skills/Assets
     to generate `.vectorcraft` and `.pdf` design files.
     """
+    if run is None:
+        run = GenerationRun()
+    run.log("Ish joyi tayyorlanmoqda...", kind="info")
     ensure_claude_workspace()
     clean_prompt = prompt.strip()
     if not clean_prompt:
@@ -1241,7 +1527,8 @@ def run_ai_design_job(
         in_lines = [f"- `{p.resolve()}`" for p in saved_inputs]
         prompt_sections.append(
             "\n## Foydalanuvchi Yuklagan Kiruvchi (Input) Fayllar:\n"
-            "Agar kiruvchi fayl `.vectorcraft`, `.pdf` yoki `.svg` bo'lsa, uni VectorCraft MCP `open_file` orqali ochib tahrirlashingiz yoki namuna sifatida ko'rishingiz mumkin:\n"
+            "- Agar kiruvchi fayl rasm (`.jpg`, `.jpeg`, `.png`, `.webp`) bo'lsa, uni avval `Read` tool orqali ko'rib, barcha matn, rang, shakl va joylashuvini tahlil qiling.\n"
+            "- Agar kiruvchi fayl `.vectorcraft`, `.pdf` yoki `.svg` bo'lsa, uni VectorCraft MCP `open_file` orqali ochib tahrirlashingiz yoki namuna sifatida ko'rishingiz mumkin:\n"
             + "\n".join(in_lines)
         )
 
@@ -1264,73 +1551,43 @@ def run_ai_design_job(
         "--allowedTools",
         "mcp__vectorcraft__*,Read,Write,Edit,Glob,Grep,Bash",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
     ]
     if model and model.strip():
         cmd.extend(["--model", model.strip()])
 
     started_at = time.time()
     env = _build_claude_env()
+    run.job_id = job_id
+    run.log(f"Job yaratildi: {job_id}. Claude Code ishga tushirilmoqda...", kind="info")
 
-    try:
-        res = subprocess.run(
-            cmd,
-            cwd=str(CLAUDE_WORKSPACE_DIR),
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Claude Code javob kutish vaqti (300 soniya) tugadi.")
-
+    stream = _run_claude_streaming(cmd, env, run)
     duration_sec = round(time.time() - started_at, 1)
-    raw_stdout = (res.stdout or "").strip()
-    raw_stderr = (res.stderr or "").strip()
 
-    assistant_reply = ""
-    cost_usd: Optional[float] = None
-    num_turns: Optional[int] = None
-    is_error = res.returncode != 0
+    if stream["cancelled"]:
+        run.log("Generatsiya foydalanuvchi tomonidan to'xtatildi.", kind="error")
+        raise GenerationCancelled("Generatsiya to'xtatildi.")
+    if stream["timed_out"]:
+        raise RuntimeError(f"Claude Code javob kutish vaqti ({AI_DESIGN_TIMEOUT_SEC} soniya) tugadi.")
 
-    if raw_stdout:
-        # Parse JSON output from `claude -p --output-format json`
-        try:
-            parsed = json.loads(raw_stdout)
-            if isinstance(parsed, dict):
-                assistant_reply = str(parsed.get("result") or parsed.get("message") or "")
-                cost_usd = parsed.get("total_cost_usd") or parsed.get("cost_usd")
-                num_turns = parsed.get("num_turns")
-                if parsed.get("is_error"):
-                    is_error = True
-        except Exception:
-            # Might be multiple JSON lines or plain text
-            for line in reversed(raw_stdout.splitlines()):
-                line = line.strip()
-                if line.startswith("{") and line.endswith("}"):
-                    try:
-                        obj = json.loads(line)
-                        if isinstance(obj, dict) and ("result" in obj or "message" in obj):
-                            assistant_reply = str(obj.get("result") or obj.get("message") or "")
-                            cost_usd = obj.get("total_cost_usd") or obj.get("cost_usd")
-                            num_turns = obj.get("num_turns")
-                            break
-                    except Exception:
-                        pass
-            if not assistant_reply:
-                assistant_reply = _strip_ansi(raw_stdout)
+    assistant_reply = stream["result_text"] or stream["last_text"]
+    cost_usd: Optional[float] = stream["cost_usd"]
+    num_turns: Optional[int] = stream["num_turns"]
+    is_error = stream["returncode"] != 0 or stream["is_error"]
+    raw_stderr = "\n".join(stream["raw_lines"][-40:])
 
     if not assistant_reply and raw_stderr:
         assistant_reply = _strip_ansi(raw_stderr)
+
+    run.log("Chiqish fayllari tekshirilmoqda (.vectorcraft + .pdf)...", kind="info")
 
     # Ensure both .vectorcraft and .pdf outputs exist if any design file was produced
     conversion_notes = _ensure_dual_outputs(out_dir, safe_stem)
     outputs_payload = _collect_job_outputs_payload(job_id, out_dir)
 
     if is_error and not outputs_payload["output_files"]:
-        err_msg = assistant_reply or raw_stderr or f"Claude Code xatolik bilan yakunlandi (kod {res.returncode})."
+        err_msg = assistant_reply or raw_stderr or f"Claude Code xatolik bilan yakunlandi (kod {stream['returncode']})."
         if "not logged in" in err_msg.lower() or "authentication" in err_msg.lower() or "oauth" in err_msg.lower():
             err_msg += "\n\nIltimos, 'Skills & Claude Sozlamalari' bo'limidan Claude obunangizga login qiling."
         raise RuntimeError(err_msg)
@@ -1350,6 +1607,11 @@ def run_ai_design_job(
         "outputs": [f["filename"] for f in outputs_payload["output_files"]],
     }
     save_job_meta(job_id, meta)
+    run.log(
+        f"Tayyor! {len(outputs_payload['output_files'])} ta fayl, {duration_sec} s"
+        + (f", ${cost_usd:.4f}" if isinstance(cost_usd, (int, float)) else ""),
+        kind="success",
+    )
 
     return {
         "job_id": job_id,

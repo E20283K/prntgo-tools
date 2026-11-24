@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import io
+import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Dict
@@ -89,6 +92,46 @@ class PrintImpStates(StatesGroup):
 class AiDesignStates(StatesGroup):
     waiting_size = State()
     waiting_prompt = State()
+    running = State()
+
+
+# Per-user coordination for multi-message / forwarded-photo AI design inputs
+_AI_USER_LOCKS: Dict[int, asyncio.Lock] = {}
+_AI_PENDING_TIMERS: Dict[int, asyncio.Task[Any]] = {}
+_AI_STAGING_ROOT = Path(tempfile.gettempdir()) / "printhub_tg_ai"
+
+_ATTACHMENT_HINT_RE = re.compile(
+    r"\b("
+    r"rasm\w*|surat\w*|foto\w*|skrinshot\w*|screenshot\w*|"
+    r"fayl\w*|file\w*|namuna\w*|shablon\w*|template\w*|"
+    r"image\w*|photo\w*|picture\w*|pic\w*|"
+    r"shu\s+etiketka\w*|bu\s+etiketka\w*|ushbu\s+etiketka\w*|"
+    r"shu\s+dizayn\w*|bu\s+dizayn\w*|ushbu\s+dizayn\w*|"
+    r"vektor\s+qilib\s+chiz\w*|vektorlashtir\w*|qayta\s+chiz\w*"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _get_ai_lock(user_id: int) -> asyncio.Lock:
+    lock = _AI_USER_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _AI_USER_LOCKS[user_id] = lock
+    return lock
+
+
+def _cancel_ai_timer(user_id: int) -> None:
+    task = _AI_PENDING_TIMERS.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def _cleanup_ai_staging(user_id: int) -> None:
+    _cancel_ai_timer(user_id)
+    user_dir = _AI_STAGING_ROOT / str(user_id)
+    if user_dir.exists():
+        shutil.rmtree(user_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +192,8 @@ async def _reply_or_edit(
 @router.message(CommandStart())
 @router.message(Command("menu"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
+    if message.from_user:
+        _cleanup_ai_staging(message.from_user.id)
     await state.clear()
     await message.answer(
         "👋 <b>PrintHub Poligrafiya Botiga xush kelibsiz!</b>\n\n"
@@ -164,6 +209,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    if message.from_user:
+        _cleanup_ai_staging(message.from_user.id)
     await state.clear()
     await message.answer(
         "❌ Joriy amal bekor qilindi. Kerakli bo'limni tanlang:",
@@ -193,6 +240,8 @@ async def cmd_ai_design(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "menu:home")
 async def cb_home(call: CallbackQuery, state: FSMContext) -> None:
+    if call.from_user:
+        _cleanup_ai_staging(call.from_user.id)
     await state.clear()
     await call.message.edit_text(
         "🏠 <b>Bosh menyu</b> — kerakli asbobni tanlang:",
@@ -729,6 +778,8 @@ async def print_got_qty(message: Message, state: FSMContext) -> None:
 # 4. AI DESIGN (CLAUDE CODE + VECTORCRAFT MCP) FLOW
 # ---------------------------------------------------------------------------
 async def _start_ai_design(event: Message | CallbackQuery, state: FSMContext) -> None:
+    if event.from_user:
+        _cleanup_ai_staging(event.from_user.id)
     await state.clear()
     skills = claude_design_service.list_skills()
     assets = claude_design_service.list_assets()
@@ -766,13 +817,13 @@ async def cb_ai_got_size(call: CallbackQuery, state: FSMContext) -> None:
     _, w_str, h_str = call.data.split(":", 2)
     w_mm = float(w_str) if float(w_str) > 0 else None
     h_mm = float(h_str) if float(h_str) > 0 else None
-    await state.update_data(width_mm=w_mm, height_mm=h_mm)
+    await state.update_data(width_mm=w_mm, height_mm=h_mm, pending_files=[], pending_prompt="")
     await state.set_state(AiDesignStates.waiting_prompt)
     size_label = f"{w_mm:g}×{h_mm:g} mm" if (w_mm and h_mm) else "Erkin o'lcham"
     await call.message.edit_text(
         f"✨ Tanlangan o'lcham: <b>{size_label}</b>\n\n"
         f"2/2 — <b>Dizayn topshirig'ini (TZ) yozib yuboring</b>\n"
-        f"(Xohlasangiz rasm, skrinshot yoki faylga izoh (caption) qilib yuborishingiz ham mumkin):",
+        f"(Rasm, skrinshot yoki faylni izoh bilan yoki alohida forward qilib yuborishingiz ham mumkin):",
         reply_markup=cancel_kb(),
     )
     await call.answer()
@@ -780,58 +831,258 @@ async def cb_ai_got_size(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AiDesignStates.waiting_size)
 async def msg_ai_got_custom_size(message: Message, state: FSMContext) -> None:
-    raw = (message.text or "").lower().replace("mm", "").replace("×", "x").replace("*", "x").strip()
-    if "x" in raw:
-        parts = raw.split("x", 1)
-        try:
-            w_mm = float(parts[0].strip())
-            h_mm = float(parts[1].strip())
-            await state.update_data(width_mm=w_mm, height_mm=h_mm)
-            await state.set_state(AiDesignStates.waiting_prompt)
-            await message.answer(
-                f"✨ O'lcham: <b>{w_mm:g}×{h_mm:g} mm</b>\n\n"
-                f"2/2 — <b>Dizayn topshirig'ini (TZ) yozib yuboring:</b>",
-                reply_markup=cancel_kb(),
-            )
-            return
-        except ValueError:
-            pass
-    # If the user directly typed a prompt instead of size, run directly!
+    if not message.photo and not message.document:
+        raw = (message.text or "").lower().replace("mm", "").replace("×", "x").replace("*", "x").strip()
+        if "x" in raw:
+            parts = raw.split("x", 1)
+            try:
+                w_mm = float(parts[0].strip())
+                h_mm = float(parts[1].strip())
+                await state.update_data(width_mm=w_mm, height_mm=h_mm, pending_files=[], pending_prompt="")
+                await state.set_state(AiDesignStates.waiting_prompt)
+                await message.answer(
+                    f"✨ O'lcham: <b>{w_mm:g}×{h_mm:g} mm</b>\n\n"
+                    f"2/2 — <b>Dizayn topshirig'ini (TZ) yozib yuboring</b>\n"
+                    f"(Rasm/faylni izoh bilan yoki alohida forward qilib yuborishingiz ham mumkin):",
+                    reply_markup=cancel_kb(),
+                )
+                return
+            except ValueError:
+                pass
+    # User directly sent a prompt or photo/file instead of size -> handle in waiting_prompt
     await state.update_data(width_mm=None, height_mm=None)
-    await _run_bot_ai_design(message, state)
+    await state.set_state(AiDesignStates.waiting_prompt)
+    await _handle_ai_design_input(message, state)
 
 
 @router.message(AiDesignStates.waiting_prompt)
 async def msg_ai_got_prompt(message: Message, state: FSMContext) -> None:
-    await _run_bot_ai_design(message, state)
+    await _handle_ai_design_input(message, state)
 
 
-async def _run_bot_ai_design(message: Message, state: FSMContext) -> None:
-    prompt_text = (message.text or message.caption or "").strip()
-    if not prompt_text:
-        await message.answer("Iltimos, dizayn topshirig'ini matn sifatida yozing:")
-        return
+@router.message(AiDesignStates.running)
+async def msg_ai_while_running(message: Message) -> None:
+    await message.answer(
+        "⏳ <b>AI dizayn hozir tayyorlanmoqda.</b> Iltimos, tugashini kuting (yoki /cancel bosing)."
+    )
 
+
+@router.callback_query(AiDesignStates.waiting_prompt, F.data == "ai_run:now")
+async def cb_ai_run_now(call: CallbackQuery, state: FSMContext) -> None:
+    user_id = call.from_user.id
+    _cancel_ai_timer(user_id)
     data = await state.get_data()
-    w_mm = data.get("width_mm")
-    h_mm = data.get("height_mm")
+    if not (data.get("pending_prompt") or "").strip():
+        await call.answer("Avval dizayn topshirig'ini yozing.", show_alert=True)
+        return
+    await call.answer("Dizayn yaratish boshlandi!")
+    await _execute_bot_ai_design(call.message, state, user_id)
 
-    uploaded_files: list[tuple[str, bytes]] = []
+
+@router.callback_query(AiDesignStates.waiting_prompt, F.data == "ai_run:vectorize")
+async def cb_ai_run_vectorize(call: CallbackQuery, state: FSMContext) -> None:
+    user_id = call.from_user.id
+    _cancel_ai_timer(user_id)
+    data = await state.get_data()
+    if not data.get("pending_files"):
+        await call.answer("Biriktirilgan rasm topilmadi.", show_alert=True)
+        return
+    await state.update_data(
+        pending_prompt=(
+            "Ushbu rasmdagi etiketka/dizaynni barcha matnlari, ranglari, shakllari "
+            "va joylashuvi bilan aniq vektor formatida qayta chizib ber."
+        )
+    )
+    await call.answer("Rasmni vektorlashtirish boshlandi!")
+    await _execute_bot_ai_design(call.message, state, user_id)
+
+
+async def _stage_message_file(message: Message, user_id: int, index: int) -> Dict[str, str] | None:
+    """Download a photo or document from a Telegram message into the user's temp staging dir."""
+    user_dir = _AI_STAGING_ROOT / str(user_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+
     if message.document:
+        doc = message.document
+        orig_name = Path(doc.file_name or f"input_{index}.bin").name
         buf = io.BytesIO()
-        await message.bot.download(message.document, destination=buf)
-        uploaded_files.append((message.document.file_name or "input.bin", buf.getvalue()))
-    elif message.photo:
+        await message.bot.download(doc, destination=buf)
+        saved_path = user_dir / f"{index:02d}_{orig_name}"
+        saved_path.write_bytes(buf.getvalue())
+        return {"name": orig_name, "path": str(saved_path)}
+
+    if message.photo:
         photo = message.photo[-1]
+        orig_name = f"photo_{photo.file_unique_id}.jpg"
         buf = io.BytesIO()
         await message.bot.download(photo, destination=buf)
-        uploaded_files.append((f"photo_{photo.file_unique_id}.jpg", buf.getvalue()))
+        saved_path = user_dir / f"{index:02d}_{orig_name}"
+        saved_path.write_bytes(buf.getvalue())
+        return {"name": orig_name, "path": str(saved_path)}
+
+    return None
+
+
+async def _handle_ai_design_input(message: Message, state: FSMContext) -> None:
+    """
+    Collect text prompts and attachments across one OR multiple messages
+    (e.g. text followed by a forwarded photo, forwarded photo followed by text,
+    photo with caption, or multi-photo album) before launching Claude Code.
+    """
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    lock = _get_ai_lock(user_id)
+
+    async with lock:
+        current_state = await state.get_state()
+        if current_state == AiDesignStates.running.state:
+            await message.answer(
+                "⏳ <b>AI dizayn hozir tayyorlanmoqda.</b> Iltimos, tugashini kuting (yoki /cancel bosing)."
+            )
+            return
+
+        _cancel_ai_timer(user_id)
+
+        data = await state.get_data()
+        pending_files: list[Dict[str, str]] = list(data.get("pending_files") or [])
+        pending_prompt: str = (data.get("pending_prompt") or "").strip()
+
+        staged = await _stage_message_file(message, user_id, len(pending_files) + 1)
+        if staged:
+            pending_files.append(staged)
+
+        incoming_text = (message.text or message.caption or "").strip()
+        if incoming_text:
+            pending_prompt = f"{pending_prompt}\n{incoming_text}" if pending_prompt else incoming_text
+
+        await state.update_data(pending_files=pending_files, pending_prompt=pending_prompt)
+
+        if not staged and not incoming_text:
+            await message.answer(
+                "Iltimos, dizayn topshirig'ini matn sifatida yozing yoki rasm/fayl yuboring:",
+                reply_markup=cancel_kb(),
+            )
+            return
+
+        # Case 1: Both prompt AND at least one file are ready -> short debounce (for albums/extra forwards) then run
+        if pending_prompt and pending_files:
+            delay = 0.9
+
+            async def _delayed_run() -> None:
+                try:
+                    await asyncio.sleep(delay)
+                    await _execute_bot_ai_design(message, state, user_id)
+                except asyncio.CancelledError:
+                    return
+
+            _AI_PENDING_TIMERS[user_id] = asyncio.create_task(_delayed_run())
+            return
+
+        # Case 2: File(s) received without prompt text (e.g. forwarded photo) -> stage and wait for prompt
+        if pending_files and not pending_prompt:
+            delay = 0.8 if message.media_group_id else 0.2
+
+            async def _delayed_file_ack() -> None:
+                try:
+                    await asyncio.sleep(delay)
+                    cur_data = await state.get_data()
+                    cur_files = cur_data.get("pending_files") or []
+                    cur_prompt = (cur_data.get("pending_prompt") or "").strip()
+                    if cur_prompt or not cur_files:
+                        return
+                    kb = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="✨ Shu rasmni vektorlashtirish",
+                                    callback_data="ai_run:vectorize",
+                                )
+                            ],
+                            [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="menu:home")],
+                        ]
+                    )
+                    await message.answer(
+                        f"📎 <b>{len(cur_files)} ta rasm/fayl qabul qilindi.</b>\n"
+                        f"Endi dizayn topshirig'ini matn sifatida yozing (yoki yana fayl yuboring):",
+                        reply_markup=kb,
+                    )
+                except asyncio.CancelledError:
+                    return
+
+            _AI_PENDING_TIMERS[user_id] = asyncio.create_task(_delayed_file_ack())
+            return
+
+        # Case 3: Text prompt only, no files yet
+        if _ATTACHMENT_HINT_RE.search(pending_prompt):
+            # User mentioned an image/file (e.g. "Shu rasmdagi etiketkani...") -> wait briefly in case
+            # the forwarded photo is already in flight, otherwise ask them to attach/forward it.
+            async def _delayed_ask_file() -> None:
+                try:
+                    await asyncio.sleep(0.7)
+                    cur_data = await state.get_data()
+                    if cur_data.get("pending_files"):
+                        return
+                    kb = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="🚀 Rasmsiz boshlash", callback_data="ai_run:now")],
+                            [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="menu:home")],
+                        ]
+                    )
+                    await message.answer(
+                        "📝 <b>Topshiriq qabul qilindi!</b>\n"
+                        "Rasm yoki faylni hozir yuboring (yoki <b>forward</b> qiling) — "
+                        "avtomatik birlashtirib dizaynni boshlayman.\n\n"
+                        "Agar rasm kerak bo'lmasa, quyidagi tugmani bosing:",
+                        reply_markup=kb,
+                    )
+                except asyncio.CancelledError:
+                    return
+
+            _AI_PENDING_TIMERS[user_id] = asyncio.create_task(_delayed_ask_file())
+        else:
+            # Normal text-only prompt -> brief 1.5s grace window in case a photo arrives right after
+            async def _delayed_text_run() -> None:
+                try:
+                    await asyncio.sleep(1.5)
+                    await _execute_bot_ai_design(message, state, user_id)
+                except asyncio.CancelledError:
+                    return
+
+            _AI_PENDING_TIMERS[user_id] = asyncio.create_task(_delayed_text_run())
+
+
+async def _execute_bot_ai_design(target_msg: Message, state: FSMContext, user_id: int) -> None:
+    lock = _get_ai_lock(user_id)
+    async with lock:
+        current_state = await state.get_state()
+        if current_state == AiDesignStates.running.state:
+            return
+        _AI_PENDING_TIMERS.pop(user_id, None)
+
+        data = await state.get_data()
+        prompt_text = (data.get("pending_prompt") or "").strip()
+        if not prompt_text:
+            await target_msg.answer("Iltimos, dizayn topshirig'ini matn sifatida yozing:", reply_markup=cancel_kb())
+            return
+
+        w_mm = data.get("width_mm")
+        h_mm = data.get("height_mm")
+        pending_files: list[Dict[str, str]] = list(data.get("pending_files") or [])
+
+        uploaded_files: list[tuple[str, bytes]] = []
+        for item in pending_files:
+            p = Path(item["path"])
+            if p.is_file():
+                uploaded_files.append((item["name"], p.read_bytes()))
+
+        await state.set_state(AiDesignStates.running)
 
     skills = [s["slug"] for s in claude_design_service.list_skills()]
     assets = [a["name"] for a in claude_design_service.list_assets()]
 
-    wait_msg = await message.answer(
-        "⏳ <b>Claude Code + VectorCraft MCP ishlamoqda...</b>\n"
+    files_note = f"\n📎 Biriktirilgan fayllar: <b>{len(uploaded_files)} ta</b>" if uploaded_files else ""
+    wait_msg = await target_msg.answer(
+        "⏳ <b>Claude Code + VectorCraft MCP ishlamoqda...</b>"
+        f"{files_note}\n"
         "Maxsus skillar asosida <code>.vectorcraft</code> va <code>.pdf</code> dizayn chizilmoqda (30-90 soniya olishi mumkin)."
     )
 
@@ -854,13 +1105,14 @@ async def _run_bot_ai_design(message: Message, state: FSMContext) -> None:
         reply_summary = (res.get("assistant_reply") or "").strip()
         if len(reply_summary) > 650:
             reply_summary = reply_summary[:650] + "..."
+        safe_summary = html.escape(reply_summary)
 
         # 1. Send .vectorcraft file if present
         if vc_file:
             vc_path = get_job_output_file(job_id, vc_file)
-            await message.answer_document(
+            await target_msg.answer_document(
                 FSInputFile(str(vc_path)),
-                caption=f"🎨 <b>VectorCraft standart fayli:</b> <code>{vc_file}</code>",
+                caption=f"🎨 <b>VectorCraft standart fayli:</b> <code>{html.escape(vc_file)}</code>",
             )
 
         # 2. Send .pdf file with Val Montaji & CorelDRAW (.cdr) buttons
@@ -883,21 +1135,24 @@ async def _run_bot_ai_design(message: Message, state: FSMContext) -> None:
                     [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="menu:home")],
                 ]
             )
-            await message.answer_document(
+            await target_msg.answer_document(
                 FSInputFile(str(pdf_path)),
                 caption=(
                     f"✅ <b>AI Dizayn PDF tayyor!</b> ({res.get('duration_sec', 0)} s)\n\n"
-                    + (f"💬 <b>Claude hisoboti:</b>\n{reply_summary}" if reply_summary else "")
+                    + (f"💬 <b>Claude hisoboti:</b>\n{safe_summary}" if safe_summary else "")
                 ),
                 reply_markup=kb,
             )
         else:
-            await message.answer(
-                f"ℹ️ <b>Claude javobi:</b>\n{reply_summary or 'Fayl yaratilmadi.'}",
+            await target_msg.answer(
+                f"ℹ️ <b>Claude javobi:</b>\n{safe_summary or 'Fayl yaratilmadi.'}",
                 reply_markup=main_menu_kb(),
             )
 
         await state.clear()
     except Exception as e:
-        await wait_msg.edit_text(f"❌ Xatolik: {e}", reply_markup=cancel_kb())
+        await state.clear()
+        await wait_msg.edit_text(f"❌ Xatolik: {html.escape(str(e))}", reply_markup=cancel_kb())
+    finally:
+        _cleanup_ai_staging(user_id)
 
