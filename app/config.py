@@ -17,7 +17,12 @@ SELA_SET_DIR = DATA_DIR / "sela_set"
 FONTS_DIR = DATA_DIR / "fonts"
 JOBS_DIR = DATA_DIR / "jobs"
 
-# Claude Code & VectorCraft persistent directories
+# Claude Code & VectorCraft persistent directories (stored in /app/data volume)
+TOOLS_DIR = DATA_DIR / "tools"
+TOOLS_BIN_DIR = TOOLS_DIR / "bin"
+TOOLS_NODE_BIN_DIR = TOOLS_DIR / "node" / "bin"
+TOOLS_NPM_BIN_DIR = TOOLS_DIR / "npm-global" / "bin"
+
 CLAUDE_HOME_DIR = DATA_DIR / "claude_home"
 CLAUDE_WORKSPACE_DIR = DATA_DIR / "claude_workspace"
 CLAUDE_SKILLS_DIR = CLAUDE_WORKSPACE_DIR / ".claude" / "skills"
@@ -32,6 +37,11 @@ VECTORCRAFT_WEB_DIR = Path(
     os.environ.get("VECTORCRAFT_WEB_DIR", str(DATA_DIR / "vectorcraft_web"))
 ).resolve()
 
+# Ensure persistent tool bin directories are on PATH
+_extra_paths = [str(TOOLS_NPM_BIN_DIR), str(TOOLS_NODE_BIN_DIR), str(TOOLS_BIN_DIR)]
+_current_path = os.environ.get("PATH", "")
+os.environ["PATH"] = os.pathsep.join(_extra_paths + ([_current_path] if _current_path else []))
+
 # Ensure required directories exist
 for _d in (
     DATA_DIR,
@@ -39,6 +49,8 @@ for _d in (
     SELA_SET_DIR,
     FONTS_DIR,
     JOBS_DIR,
+    TOOLS_DIR,
+    TOOLS_BIN_DIR,
     CLAUDE_HOME_DIR,
     CLAUDE_WORKSPACE_DIR,
     CLAUDE_SKILLS_DIR,

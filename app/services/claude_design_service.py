@@ -27,6 +27,10 @@ from app.config import (
     CLAUDE_SKILLS_DIR,
     CLAUDE_UPLOADS_DIR,
     CLAUDE_WORKSPACE_DIR,
+    TOOLS_BIN_DIR,
+    TOOLS_DIR,
+    TOOLS_NODE_BIN_DIR,
+    TOOLS_NPM_BIN_DIR,
     VECTORCRAFT_WEB_DIR,
 )
 from app.jobs import bundle_job_outputs_zip, create_job, get_job_dir, get_job_output_file, save_job_meta
@@ -470,11 +474,134 @@ def get_login_session_state() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# System Status (Claude CLI, Auth, VectorCraft CLI, VectorCraft Web)
+# System Status & One-Time Persistent Volume Tools Bootstrap (/app/data/tools)
 # ---------------------------------------------------------------------------
+_BOOTSTRAP_LOCK = threading.Lock()
+_BOOTSTRAP_STATE: Dict[str, Any] = {
+    "running": False,
+    "step": "",
+    "error": "",
+}
+NODE_VERSION = "22.14.0"
+VECTORCRAFT_VERSION = "0.24.1"
+
+
+def _bootstrap_tools_worker() -> None:
+    """
+    One-time background installer that places Node.js, Claude Code CLI,
+    vectorcraft-cli, and vectorcraft-web inside the persistent `/app/data` volume
+    so `docker compose build` takes <45 seconds and tools persist across all deploys.
+    """
+    import platform
+    import tarfile
+    import urllib.request
+
+    try:
+        TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        TOOLS_BIN_DIR.mkdir(parents=True, exist_ok=True)
+        machine = platform.machine().lower()
+        is_arm = machine in ("aarch64", "arm64")
+
+        # 1. Install Node.js into /app/data/tools/node if not present (Linux)
+        if os.name == "posix" and not shutil.which("node"):
+            _BOOTSTRAP_STATE["step"] = "Node.js 22 yuklanmoqda..."
+            node_arch = "arm64" if is_arm else "x64"
+            node_url = f"https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-linux-{node_arch}.tar.xz"
+            node_archive = TOOLS_DIR / f"node-v{NODE_VERSION}.tar.xz"
+            node_dest = TOOLS_DIR / "node"
+            logger.info("Persistent volume ichiga Node.js yuklanmoqda: %s", node_url)
+            urllib.request.urlretrieve(node_url, str(node_archive))
+            node_dest.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["tar", "-xJf", str(node_archive), "-C", str(node_dest), "--strip-components=1"],
+                check=True,
+                timeout=120,
+            )
+            node_archive.unlink(missing_ok=True)
+
+        # 2. Install @anthropic-ai/claude-code into /app/data/tools/npm-global if not present
+        if os.name == "posix" and not shutil.which("claude"):
+            npm_bin = shutil.which("npm") or str(TOOLS_NODE_BIN_DIR / "npm")
+            if Path(npm_bin).is_file():
+                _BOOTSTRAP_STATE["step"] = "Claude Code CLI o'rnatilmoqda..."
+                npm_prefix = TOOLS_DIR / "npm-global"
+                npm_prefix.mkdir(parents=True, exist_ok=True)
+                logger.info("Persistent volume ichiga @anthropic-ai/claude-code o'rnatilmoqda...")
+                subprocess.run(
+                    [
+                        npm_bin,
+                        "install",
+                        "-g",
+                        "--prefix",
+                        str(npm_prefix),
+                        "@anthropic-ai/claude-code",
+                        "--no-audit",
+                        "--no-fund",
+                    ],
+                    check=True,
+                    timeout=300,
+                    env=_build_claude_env(),
+                )
+
+        # 3. Install vectorcraft-cli into /app/data/tools/bin/vectorcraft-cli if not present
+        if os.name == "posix" and not shutil.which("vectorcraft-cli"):
+            _BOOTSTRAP_STATE["step"] = "VectorCraft CLI (MCP) yuklanmoqda..."
+            vc_arch = "aarch64" if is_arm else "x86_64"
+            tar_name = f"vectorcraft-{VECTORCRAFT_VERSION}-linux-{vc_arch}.tar.gz"
+            vc_url = f"https://github.com/storytold/vectorcraft/releases/download/v{VECTORCRAFT_VERSION}/{tar_name}"
+            vc_archive = TOOLS_DIR / tar_name
+            logger.info("Persistent volume ichiga vectorcraft-cli yuklanmoqda: %s", vc_url)
+            urllib.request.urlretrieve(vc_url, str(vc_archive))
+            member_path = f"vectorcraft-{VECTORCRAFT_VERSION}-linux-{vc_arch}/bin/vectorcraft-cli"
+            with tarfile.open(str(vc_archive), "r:gz") as tf:
+                member = tf.getmember(member_path)
+                fobj = tf.extractfile(member)
+                if fobj:
+                    dest_bin = TOOLS_BIN_DIR / "vectorcraft-cli"
+                    dest_bin.write_bytes(fobj.read())
+                    dest_bin.chmod(0o755)
+            vc_archive.unlink(missing_ok=True)
+
+        # 4. Install vectorcraft-web into /app/data/vectorcraft_web if not present
+        if not (VECTORCRAFT_WEB_DIR / "index.html").is_file():
+            _BOOTSTRAP_STATE["step"] = "VectorCraft Web (WASM) yuklanmoqda..."
+            logger.info("Persistent volume ichiga vectorcraft-web yuklanmoqda...")
+            install_vectorcraft_web_bundle()
+
+        _BOOTSTRAP_STATE["step"] = ""
+        _BOOTSTRAP_STATE["error"] = ""
+        logger.info("Barcha AI va VectorCraft vositalari /app/data ichida tayyor!")
+    except Exception as exc:
+        logger.warning("Tools bootstrap xatosi: %s", exc)
+        _BOOTSTRAP_STATE["error"] = str(exc)
+    finally:
+        _BOOTSTRAP_STATE["running"] = False
+
+
+def start_background_tools_bootstrap() -> None:
+    """Start the non-blocking background installer if any tool is missing on Linux."""
+    if os.name != "posix":
+        return
+    need_install = (
+        not shutil.which("claude")
+        or not shutil.which("vectorcraft-cli")
+        or not (VECTORCRAFT_WEB_DIR / "index.html").is_file()
+    )
+    if not need_install:
+        return
+    with _BOOTSTRAP_LOCK:
+        if _BOOTSTRAP_STATE["running"]:
+            return
+        _BOOTSTRAP_STATE["running"] = True
+        _BOOTSTRAP_STATE["step"] = "Tekshirilmoqda..."
+        threading.Thread(target=_bootstrap_tools_worker, daemon=True).start()
+
+
 def _detect_binary_version(cmd: List[str]) -> Tuple[bool, str]:
     exe = shutil.which(cmd[0])
     if not exe:
+        if _BOOTSTRAP_STATE["running"]:
+            return False, _BOOTSTRAP_STATE["step"] or "Orqa fonda o'rnatilmoqda..."
         return False, "O'rnatilmagan"
     try:
         res = subprocess.run(
@@ -581,6 +708,7 @@ def _check_claude_auth(claude_installed: bool) -> Dict[str, Any]:
 
 def get_system_status() -> Dict[str, Any]:
     ensure_claude_workspace()
+    start_background_tools_bootstrap()
     claude_ok, claude_ver = _detect_binary_version(["claude", "--version"])
     vc_ok, vc_ver = _detect_binary_version(["vectorcraft-cli", "--version"])
     vc_web_ok = (VECTORCRAFT_WEB_DIR / "index.html").is_file()

@@ -81,6 +81,7 @@ async def _periodic_job_cleanup() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    claude_design_service.start_background_tools_bootstrap()
     task = asyncio.create_task(_periodic_job_cleanup())
     try:
         yield
