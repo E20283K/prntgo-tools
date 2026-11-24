@@ -1,16 +1,15 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
-ARG VECTORCRAFT_VERSION=0.24.1
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PRINTHUB_DATA_DIR=/app/data \
     HOME=/app/data/claude_home \
     CLAUDE_CONFIG_DIR=/app/data/claude_home/.claude \
-    VECTORCRAFT_WEB_DIR=/app/vectorcraft_web
+    VECTORCRAFT_WEB_DIR=/app/vectorcraft_web \
+    VECTORCRAFT_VERSION=0.24.1
 
-# 1. System packages, Node.js 22 LTS, and Claude Code CLI (with BuildKit apt & npm cache mounts)
+# 1. System packages, Node.js 22 LTS, and Claude Code CLI (NO ARG above this -> 100% Docker layer cached!)
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/root/.npm \
@@ -31,7 +30,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     fi; \
     npm install -g @anthropic-ai/claude-code --prefer-offline --no-audit --no-fund
 
-# 2. VectorCraft CLI + VectorCraft Web (cached in BuildKit /var/cache/printhub so re-deploys take <1s)
+# 2. VectorCraft CLI + VectorCraft Web (NO ARG above this -> 100% Docker layer cached!)
 RUN --mount=type=cache,target=/var/cache/printhub \
     set -eux; \
     ARCH="$(uname -m)"; \
@@ -67,12 +66,29 @@ RUN --mount=type=cache,target=/var/cache/printhub \
 
 WORKDIR /app
 
-# 3. Python dependencies (with BuildKit pip cache mount)
+# 3. Python dependencies (NO ARG above this -> 100% Docker layer cached!)
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
-# 4. Application code & pre-built frontend static assets
+# 4. Pre-declare all service & Coolify ARGs HERE (below heavy RUN layers) so Coolify
+# sees "All required ARG declarations already exist" and NEVER injects ARGs after FROM!
+ARG WEB_PASSWORD
+ARG SECRET_KEY
+ARG PUBLIC_URL
+ARG JOB_TTL_HOURS
+ARG CLAUDE_CODE_OAUTH_TOKEN
+ARG ANTHROPIC_API_KEY
+ARG TELEGRAM_BOT_TOKEN
+ARG ALLOWED_TELEGRAM_IDS
+ARG SOURCE_COMMIT
+ARG COOLIFY_URL
+ARG COOLIFY_FQDN
+ARG COOLIFY_BRANCH
+ARG COOLIFY_RESOURCE_UUID
+ARG COOLIFY_CONTAINER_NAME
+
+# 5. Application code & pre-built frontend static assets
 COPY engines/ ./engines/
 COPY app/ ./app/
 COPY bot/ ./bot/
