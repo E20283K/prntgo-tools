@@ -578,121 +578,128 @@ class ImpositionEngine:
             if progress_callback is not None:
                 progress_callback(min(current_step, total_steps), total_steps, msg)
 
-        grouped: Dict[int, List[Tuple[PDFDesignInfo, GearMatch, List[DetectedColor]]]] = {}
+        grouped: Dict[int, List[Tuple[PDFDesignInfo, GearMatch, List[DetectedColor], pymupdf.Document, pymupdf.Rect]]] = {}
         results_map: Dict[str, ImpositionItemResult] = {}
+        all_clean_docs: List[pymupdf.Document] = []
 
-        for idx, info in enumerate(design_infos, start=1):
-            current_step += 1
-            report(f"[{idx}/{total_items}] Tahlil qilinmoqda: {info.display_name}...")
-            key = info.item_key
-            c_gear, c_copies = overrides.get(key, overrides.get(str(info.file_path), (None, None)))
-            eff_w, eff_l, rot_deg = resolve_design_orientation(
-                info.width_mm, info.length_mm, cfg.rotation_mode
-            )
-            _, match, cols = self.analyze_design_info(
-                info,
-                custom_gear=c_gear,
-                custom_copies=c_copies,
-                remove_outer_border=cfg.remove_outer_border,
-                rotation_mode=cfg.rotation_mode,
-            )
-            grouped.setdefault(match.gear, []).append((info, match, cols))
-            results_map[key] = ImpositionItemResult(
-                input_path=info.file_path,
-                design_info=info,
-                gear_match=match,
-                detected_colors=cols,
-                effective_width_mm=eff_w,
-                effective_length_mm=eff_l,
-                rotation_deg=rot_deg,
-            )
+        try:
+            for idx, info in enumerate(design_infos, start=1):
+                current_step += 1
+                report(f"[{idx}/{total_items}] Tahlil qilinmoqda: {info.display_name}...")
+                key = info.item_key
+                c_gear, c_copies = overrides.get(key, overrides.get(str(info.file_path), (None, None)))
+                eff_w, eff_l, rot_deg = resolve_design_orientation(
+                    info.width_mm, info.length_mm, cfg.rotation_mode
+                )
+                match = self.gear_manager.find_best_gear(
+                    design_length_mm=eff_l,
+                    custom_copies=c_copies,
+                    custom_gear=c_gear,
+                )
+                clean_doc, clip_rect = prepare_borderless_source_doc(
+                    info.file_path, info=info, remove_border=cfg.remove_outer_border
+                )
+                all_clean_docs.append(clean_doc)
+                cols = detect_design_colors(clean_doc, clip_rect=clip_rect)
+                grouped.setdefault(match.gear, []).append((info, match, cols, clean_doc, clip_rect))
+                results_map[key] = ImpositionItemResult(
+                    input_path=info.file_path,
+                    design_info=info,
+                    gear_match=match,
+                    detected_colors=cols,
+                    effective_width_mm=eff_w,
+                    effective_length_mm=eff_l,
+                    rotation_deg=rot_deg,
+                )
 
-        for gear_num, group_items in grouped.items():
-            open_docs: List[pymupdf.Document] = []
-            try:
-                all_cols_with_owner: List[Tuple[str, StripColumnSpec]] = []
-                for info, match, cols in group_items:
-                    current_step += 1
-                    report(f"{gear_num} val uchun rang va hoshiya tayyorlanmoqda: {info.display_name}...")
-                    eff_w, eff_l, rot_deg = resolve_design_orientation(
-                        info.width_mm, info.length_mm, cfg.rotation_mode
-                    )
-                    clean_doc, clip_rect = prepare_borderless_source_doc(
-                        info.file_path, info=info, remove_border=cfg.remove_outer_border
-                    )
-                    open_docs.append(clean_doc)
-                    sep_docs = create_color_separated_docs(
-                        clean_doc, detected_colors=cols, separate_colors=cfg.separate_colors
-                    )
-                    for col_info, col_doc in sep_docs:
-                        open_docs.append(col_doc)
-                        all_cols_with_owner.append(
-                            (
-                                info.item_key,
-                                StripColumnSpec(
-                                    title=f"{info.output_stem}_{col_info.name}",
-                                    source_doc=col_doc,
-                                    source_clip_rect_pt=clip_rect,
-                                    width_mm=eff_w,
-                                    orig_length_mm=eff_l,
-                                    gear_match=match,
-                                    color_info=col_info,
-                                    rotation_deg=rot_deg,
-                                ),
+            for gear_num, group_items in grouped.items():
+                open_docs: List[pymupdf.Document] = []
+                try:
+                    all_cols_with_owner: List[Tuple[str, StripColumnSpec]] = []
+                    for info, match, cols, clean_doc, clip_rect in group_items:
+                        current_step += 1
+                        report(f"{gear_num} val uchun rang va hoshiya tayyorlanmoqda: {info.display_name}...")
+                        eff_w, eff_l, rot_deg = resolve_design_orientation(
+                            info.width_mm, info.length_mm, cfg.rotation_mode
+                        )
+                        sep_docs = create_color_separated_docs(
+                            clean_doc, detected_colors=cols, separate_colors=cfg.separate_colors
+                        )
+                        for col_info, col_doc in sep_docs:
+                            open_docs.append(col_doc)
+                            all_cols_with_owner.append(
+                                (
+                                    info.item_key,
+                                    StripColumnSpec(
+                                        title=f"{info.output_stem}_{col_info.name}",
+                                        source_doc=col_doc,
+                                        source_clip_rect_pt=clip_rect,
+                                        width_mm=eff_w,
+                                        orig_length_mm=eff_l,
+                                        gear_match=match,
+                                        color_info=col_info,
+                                        rotation_deg=rot_deg,
+                                    ),
+                                )
                             )
-                        )
 
-                batches: List[List[Tuple[str, StripColumnSpec]]] = []
-                current_batch: List[Tuple[str, StripColumnSpec]] = []
-                current_width = 0.0
+                    batches: List[List[Tuple[str, StripColumnSpec]]] = []
+                    current_batch: List[Tuple[str, StripColumnSpec]] = []
+                    current_width = 0.0
 
-                for owner_key, spec in all_cols_with_owner:
-                    added_w = spec.width_mm if not current_batch else (cfg.column_gap_mm + spec.width_mm)
-                    if (
-                        cfg.max_cylinder_width_mm > 0
-                        and current_batch
-                        and (current_width + added_w) > cfg.max_cylinder_width_mm
-                    ):
+                    for owner_key, spec in all_cols_with_owner:
+                        added_w = spec.width_mm if not current_batch else (cfg.column_gap_mm + spec.width_mm)
+                        if (
+                            cfg.max_cylinder_width_mm > 0
+                            and current_batch
+                            and (current_width + added_w) > cfg.max_cylinder_width_mm
+                        ):
+                            batches.append(current_batch)
+                            current_batch = [(owner_key, spec)]
+                            current_width = spec.width_mm
+                        else:
+                            current_batch.append((owner_key, spec))
+                            current_width += added_w
+                    if current_batch:
                         batches.append(current_batch)
-                        current_batch = [(owner_key, spec)]
-                        current_width = spec.width_mm
-                    else:
-                        current_batch.append((owner_key, spec))
-                        current_width += added_w
-                if current_batch:
-                    batches.append(current_batch)
 
-                film_len = group_items[0][1].film_length_mm
-                for b_idx, batch in enumerate(batches, start=1):
-                    report(f"{gear_num} val ({b_idx}/{len(batches)}) umumiy PDF va Grayscale Audit bajarilmoqda...")
-                    batch_specs = [s for _, s in batch]
-                    imposed_doc, audit = build_imposed_pdf_from_columns(batch_specs, cfg)
-                    try:
-                        suffix = f"_part{b_idx}" if len(batches) > 1 else ""
-                        names_tag = "_".join(
-                            dict.fromkeys(results_map[k].design_info.output_stem for k, _ in batch)
-                        )[:40]
-                        out_pdf = out_dir / f"combined_val{gear_num}_film{film_len:.2f}mm_{names_tag}{suffix}.pdf"
-                        saved = save_output_formats(
-                            imposed_doc,
-                            out_pdf,
-                            export_svg=cfg.export_svg,
-                            export_eps=cfg.export_eps,
-                        )
-                        for owner_key, _ in batch:
-                            res = results_map[owner_key]
-                            for sf in saved:
-                                if sf not in res.output_files:
-                                    res.output_files.append(sf)
-                            res.audit_report = audit
-                    finally:
-                        imposed_doc.close()
-            finally:
-                for d in open_docs:
-                    try:
-                        d.close()
-                    except Exception:
-                        pass
+                    film_len = group_items[0][1].film_length_mm
+                    for b_idx, batch in enumerate(batches, start=1):
+                        report(f"{gear_num} val ({b_idx}/{len(batches)}) umumiy PDF va Grayscale Audit bajarilmoqda...")
+                        batch_specs = [s for _, s in batch]
+                        imposed_doc, audit = build_imposed_pdf_from_columns(batch_specs, cfg)
+                        try:
+                            suffix = f"_part{b_idx}" if len(batches) > 1 else ""
+                            names_tag = "_".join(
+                                dict.fromkeys(results_map[k].design_info.output_stem for k, _ in batch)
+                            )[:40]
+                            out_pdf = out_dir / f"combined_val{gear_num}_film{film_len:.2f}mm_{names_tag}{suffix}.pdf"
+                            saved = save_output_formats(
+                                imposed_doc,
+                                out_pdf,
+                                export_svg=cfg.export_svg,
+                                export_eps=cfg.export_eps,
+                            )
+                            for owner_key, _ in batch:
+                                res = results_map[owner_key]
+                                for sf in saved:
+                                    if sf not in res.output_files:
+                                        res.output_files.append(sf)
+                                res.audit_report = audit
+                        finally:
+                            imposed_doc.close()
+                finally:
+                    for d in open_docs:
+                        try:
+                            d.close()
+                        except Exception:
+                            pass
+        finally:
+            for d in all_clean_docs:
+                try:
+                    d.close()
+                except Exception:
+                    pass
 
         current_step = total_steps
         report("Barcha fayllar muvaffaqiyatli yakunlandi!")

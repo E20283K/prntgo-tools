@@ -158,14 +158,20 @@ def _rect_nearly_equal(r1: pymupdf.Rect, r2: pymupdf.Rect, tol_pt: float = 1.5) 
     )
 
 
-def _find_sticker_borders_on_page(drawings: List[dict]) -> List[Tuple[int, dict, pymupdf.Rect]]:
+def _find_sticker_borders_on_page(
+    drawings: List[dict],
+    page_rect: Optional[pymupdf.Rect] = None,
+) -> List[Tuple[int, dict, pymupdf.Rect]]:
     """
     Detects one or multiple (e.g. 26) individual sticker border rectangles on a single PDF page.
+    Ignores any paths located outside `page_rect` (such as hidden off-page objects in cropped Form XObjects).
     """
     raw_candidates: List[Tuple[int, dict, pymupdf.Rect]] = []
     for idx, d in enumerate(drawings):
         if _is_rectangular_path(d):
             r = pymupdf.Rect(d["rect"])
+            if page_rect is not None and not _rect_contains(page_rect, r, tol_pt=3.0):
+                continue
             if any(_rect_nearly_equal(r, existing_r) for _, _, existing_r in raw_candidates):
                 continue
             raw_candidates.append((idx, d, r))
@@ -231,11 +237,15 @@ def inspect_pdf_designs(pdf_path: Path | str) -> List[PDFDesignInfo]:
         for pno in range(len(doc)):
             page = doc[pno]
             page_rect = page.cropbox if not page.cropbox.is_empty else page.rect
-            drawings = page.get_drawings()
-            text_dict = page.get_text("dict")
+            raw_drawings = page.get_drawings()
+            drawings = [
+                d for d in raw_drawings
+                if d.get("rect") is not None and page_rect.intersects(pymupdf.Rect(d["rect"]))
+            ]
+            text_dict = page.get_text("dict", clip=page_rect)
             text_blocks = [b for b in text_dict.get("blocks", []) if b.get("type") == 0]
 
-            sticker_borders = _find_sticker_borders_on_page(drawings)
+            sticker_borders = _find_sticker_borders_on_page(drawings, page_rect=page_rect)
 
             if len(sticker_borders) > 1:
                 for border_idx, border_d, border_rect in sticker_borders:
@@ -676,6 +686,118 @@ def _prune_empty_graphics_states(stream_text: str) -> str:
     return "\n".join(result_lines)
 
 
+def _get_xobject_map(doc: pymupdf.Document, owner_xref: int) -> dict[str, int]:
+    res: dict[str, int] = {}
+    try:
+        t, val = doc.xref_get_key(owner_xref, "Resources/XObject")
+        if t == "xref" and val:
+            ref_id = int(val.split()[0])
+            val = doc.xref_object(ref_id)
+            t = "dict"
+        if t == "dict" and val:
+            for m in re.finditer(r"/([A-Za-z0-9_.\-+]+)\s+(\d+)\s+0\s+R", val):
+                res["/" + m.group(1)] = int(m.group(2))
+    except Exception:
+        pass
+    return res
+
+
+def _get_form_matrix(doc: pymupdf.Document, form_xref: int) -> pymupdf.Matrix:
+    try:
+        t, val = doc.xref_get_key(form_xref, "Matrix")
+        if t == "array" and val:
+            nums = [float(x) for x in re.findall(r"[-+]?(?:\d+\.?\d*|\.\d+)", val)]
+            if len(nums) == 6:
+                return pymupdf.Matrix(*nums)
+    except Exception:
+        pass
+    return pymupdf.Matrix(1, 0, 0, 1, 0, 0)
+
+
+def _merge_form_resources_to_page(doc: pymupdf.Document, page_xref: int, form_xref: int) -> None:
+    for subkey in ("Font", "ExtGState", "ColorSpace", "Pattern", "Shading", "Properties", "XObject"):
+        try:
+            ft, fval = doc.xref_get_key(form_xref, f"Resources/{subkey}")
+            if ft == "xref" and fval:
+                fval = doc.xref_object(int(fval.split()[0]))
+                ft = "dict"
+            if ft != "dict" or not fval:
+                continue
+            pt, pval = doc.xref_get_key(page_xref, f"Resources/{subkey}")
+            if pt == "xref" and pval:
+                pval = doc.xref_object(int(pval.split()[0]))
+                pt = "dict"
+            entries: dict[str, str] = {}
+            for src in (fval, pval if pt == "dict" else ""):
+                if src:
+                    for m in re.finditer(r"(/[A-Za-z0-9_.\-+]+)\s+(\d+\s+0\s+R)", src):
+                        entries[m.group(1)] = m.group(2)
+            if entries:
+                merged_dict = "<<" + " ".join(f"{k} {v}" for k, v in entries.items()) + ">>"
+                doc.xref_set_key(page_xref, f"Resources/{subkey}", merged_dict)
+        except Exception:
+            continue
+
+
+def _inline_form_xobjects(
+    doc: pymupdf.Document,
+    page_xref: int,
+    owner_xref: int,
+    stream_bytes: bytes,
+    depth: int = 0,
+) -> Tuple[bytes, set[str]]:
+    """
+    Recursively expands Form XObject (`/Name Do`) invocations into the content stream
+    with their `/Matrix` transformation and merges their Resources into the page so that
+    nested off-page vectors and outer borders can be surgically removed.
+    """
+    if depth > 5:
+        return stream_bytes, set()
+    xmap = _get_xobject_map(doc, owner_xref)
+    if not xmap:
+        return stream_bytes, set()
+    try:
+        text = stream_bytes.decode("latin1")
+    except Exception:
+        return stream_bytes, set()
+    if "Do" not in text:
+        return stream_bytes, set()
+
+    tokens = [m.group(0) for m in _STREAM_TOKEN_RE.finditer(text)]
+    out_cmds: List[str] = []
+    operands: List[str] = []
+    inlined_names: set[str] = set()
+
+    for tok in tokens:
+        if _is_num(tok) or tok.startswith(("/", "(", "<", "[")):
+            operands.append(tok)
+            continue
+        op = tok
+        if op == "Do" and len(operands) == 1 and operands[0] in xmap:
+            xname = operands[0]
+            fxref = xmap[xname]
+            sub = doc.xref_get_key(fxref, "Subtype")
+            if sub and sub[1] == "/Form" and doc.xref_is_stream(fxref):
+                _merge_form_resources_to_page(doc, page_xref, fxref)
+                fmat = _get_form_matrix(doc, fxref)
+                fstream = doc.xref_stream(fxref) or b""
+                inlined_child, child_inlined = _inline_form_xobjects(
+                    doc, page_xref, fxref, fstream, depth + 1
+                )
+                inlined_names.add(xname)
+                inlined_names.update(child_inlined)
+                child_text = inlined_child.decode("latin1", errors="ignore")
+                mat_cmd = f"{fmat.a:.6f} {fmat.b:.6f} {fmat.c:.6f} {fmat.d:.6f} {fmat.e:.6f} {fmat.f:.6f} cm"
+                out_cmds.append(f"q\n{mat_cmd}\n{child_text}\nQ")
+                operands.clear()
+                continue
+        cmd_str = (" ".join(operands) + " " + op).strip()
+        out_cmds.append(cmd_str)
+        operands.clear()
+
+    return "\n".join(out_cmds).encode("latin1"), inlined_names
+
+
 def prepare_borderless_source_doc(
     pdf_path: Path | str,
     info: Optional[PDFDesignInfo] = None,
@@ -685,7 +807,8 @@ def prepare_borderless_source_doc(
     """
     Opens the source PDF and creates a pure, isolated 1-page vector PDF for `info`
     with exact dimensions `(0, 0, width_pt, height_pt)`:
-    - Physically deletes all vectors and text belonging to other stickers on a multi-sticker sheet.
+    - Physically deletes all vectors and text belonging to other stickers on a multi-sticker sheet
+      (including nested Form XObjects such as `/fullpage`).
     - Physically deletes the outer border rectangle (`hoshiya`) without using `re W n` clipping masks.
     Returns `(isolated_doc, normalized_rect_pt)`. Caller is responsible for closing `isolated_doc`.
     """
@@ -704,6 +827,7 @@ def prepare_borderless_source_doc(
         xrefs = page.get_contents()
         if xrefs:
             raw_stream = page.read_contents()
+            raw_stream, inlined_xobjs = _inline_form_xobjects(doc, page.xref, page.xref, raw_stream)
             inv_mat = ~page.transformation_matrix
             p0 = pymupdf.Point(design_rect.x0, design_rect.y0) * inv_mat
             p1 = pymupdf.Point(design_rect.x1, design_rect.y1) * inv_mat
@@ -720,6 +844,16 @@ def prepare_borderless_source_doc(
                 remove_border=remove_border and info.has_outer_border,
             )
             doc.update_stream(xrefs[0], isolated_stream)
+
+            if inlined_xobjs:
+                try:
+                    xmap = _get_xobject_map(doc, page.xref)
+                    kept_xobjs = [
+                        f"{k} {v} 0 R" for k, v in xmap.items() if k not in inlined_xobjs
+                    ]
+                    doc.xref_set_key(page.xref, "Resources/XObject", "<<" + " ".join(kept_xobjs) + ">>")
+                except Exception:
+                    pass
 
             # Prune unused font references from page Resources/Font so multi-megabyte unused fonts
             # from other stickers on a sheet are garbage-collected upon save
@@ -745,6 +879,10 @@ def prepare_borderless_source_doc(
         mb = page.mediabox
         page.set_cropbox(mb)
 
-        return doc, mb
+        # Garbage-collect unreferenced Form XObjects and fonts immediately in memory
+        compact_bytes = doc.tobytes(garbage=3)
+        doc.close()
+        clean_doc = pymupdf.open("pdf", compact_bytes)
+        return clean_doc, clean_doc[0].mediabox
     finally:
         src_doc.close()

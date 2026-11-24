@@ -165,7 +165,11 @@ def sela_config() -> Dict[str, Any]:
 async def sela_upload_template(file: UploadFile = File(...)) -> Dict[str, Any]:
     try:
         raw = await file.read()
-        return sela_service.save_uploaded_template(file.filename or "template.pdf", raw)
+        return await asyncio.to_thread(
+            sela_service.save_uploaded_template,
+            file.filename or "template.pdf",
+            raw,
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -245,7 +249,8 @@ async def sela_generate(
         csv_bytes = await csv_file.read() if csv_file else None
         tpl_bytes = await template_file.read() if template_file else None
 
-        return sela_service.generate_sela_job(
+        return await asyncio.to_thread(
+            sela_service.generate_sela_job,
             items_payload=items_payload,
             csv_bytes=csv_bytes,
             csv_filename=csv_file.filename if csv_file else None,
@@ -330,7 +335,8 @@ async def label_imp_inspect(
         gear_val = int(custom_gear) if (custom_gear and custom_gear.strip().isdigit()) else None
         copies_val = int(custom_copies) if (custom_copies and custom_copies.strip().isdigit()) else None
 
-        return label_imp_service.inspect_pdf_sources(
+        return await asyncio.to_thread(
+            label_imp_service.inspect_pdf_sources,
             uploaded_files=uploaded,
             from_job_id=from_job_id or None,
             from_filename=from_filename or None,
@@ -371,7 +377,8 @@ async def label_imp_preview(
         copies_val = int(custom_copies) if (custom_copies and custom_copies.strip().isdigit()) else None
         rm_w = float(regmark_custom_width_mm) if (regmark_custom_width_mm and regmark_custom_width_mm.strip()) else None
 
-        pdf_bytes, page_count = label_imp_service.preview_label_imposition_pdf(
+        pdf_bytes, page_count = await asyncio.to_thread(
+            label_imp_service.preview_label_imposition_pdf,
             uploaded_files=uploaded,
             from_job_id=from_job_id or None,
             from_filename=from_filename or None,
@@ -432,7 +439,8 @@ async def label_imp_run(
         copies_val = int(custom_copies) if (custom_copies and custom_copies.strip().isdigit()) else None
         rm_w = float(regmark_custom_width_mm) if (regmark_custom_width_mm and regmark_custom_width_mm.strip()) else None
 
-        return label_imp_service.run_label_imposition_job(
+        return await asyncio.to_thread(
+            label_imp_service.run_label_imposition_job,
             uploaded_files=uploaded,
             from_job_id=from_job_id or None,
             from_filename=from_filename or None,
@@ -477,7 +485,9 @@ async def print_imp_preflight(
         expected = None
         if trim_w_mm and trim_h_mm and trim_w_mm.strip() and trim_h_mm.strip():
             expected = (float(trim_w_mm), float(trim_h_mm))
-        return print_imp_service.run_preflight_analysis(fronts, dieline, expected)
+        return await asyncio.to_thread(
+            print_imp_service.run_preflight_analysis, fronts, dieline, expected
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -524,7 +534,8 @@ async def print_imp_run(
         if quantities_csv and quantities_csv.strip():
             qtys = [int(x.strip()) for x in quantities_csv.split(",") if x.strip().isdigit()]
 
-        return print_imp_service.run_print_imposition_job(
+        return await asyncio.to_thread(
+            print_imp_service.run_print_imposition_job,
             front_files=fronts,
             back_file=back,
             dieline_file=dieline,
