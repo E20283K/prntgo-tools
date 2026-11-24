@@ -360,10 +360,12 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
       {handoff && (
         <Alert>
           <Link2 />
-          <AlertTitle>Sela Generator natijasi ulandi</AlertTitle>
+          <AlertTitle>
+            {handoff.source_label || "Sela Generator natijasi"} ulandi
+          </AlertTitle>
           <AlertDescription className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <span>
-              {handoff.filename} ({handoff.total_labels} ta stiker)
+              {handoff.filename} ({handoff.total_labels} ta dizayn/stiker)
             </span>
             <Button
               variant="outline"

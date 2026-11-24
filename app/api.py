@@ -32,7 +32,7 @@ from app.corel_converter import (
     build_standalone_converter_zip,
 )
 from app.jobs import cleanup_old_jobs, get_job_output_file
-from app.services import label_imp_service, print_imp_service, sela_service
+from app.services import extractor_service, label_imp_service, print_imp_service, sela_service
 
 logger = logging.getLogger("printhub.api")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -537,14 +537,34 @@ def print_imp_presets() -> Dict[str, Any]:
 
 @app.post("/api/print-imp/preflight", dependencies=[Depends(require_auth)])
 async def print_imp_preflight(
-    front_files: List[UploadFile] = File(...),
+    front_files: Optional[List[UploadFile]] = File(None),
     dieline_file: Optional[UploadFile] = File(None),
+    from_job_id: Optional[str] = Form(None),
+    from_front_filenames_json: Optional[str] = Form(None),
+    from_dieline_filename: Optional[str] = Form(None),
     trim_w_mm: Optional[str] = Form(None),
     trim_h_mm: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
     try:
-        fronts = [(f.filename or "front.pdf", await f.read()) for f in front_files]
-        dieline = (dieline_file.filename or "dieline.pdf", await dieline_file.read()) if dieline_file else None
+        fronts: List[tuple[str, bytes]] = []
+        if from_job_id and from_front_filenames_json:
+            fnames = json.loads(from_front_filenames_json)
+            for fn in fnames:
+                p = get_job_output_file(from_job_id, fn)
+                fronts.append((p.name, p.read_bytes()))
+        for f in (front_files or []):
+            if f.filename:
+                fronts.append((f.filename, await f.read()))
+        if not fronts:
+            raise ValueError("Kamida bitta Oldi (Front) PDF fayl tanlang.")
+
+        dieline = None
+        if dieline_file and dieline_file.filename:
+            dieline = (dieline_file.filename, await dieline_file.read())
+        elif from_job_id and from_dieline_filename:
+            dp = get_job_output_file(from_job_id, from_dieline_filename)
+            dieline = (dp.name, dp.read_bytes())
+
         expected = None
         if trim_w_mm and trim_h_mm and trim_w_mm.strip() and trim_h_mm.strip():
             expected = (float(trim_w_mm), float(trim_h_mm))
@@ -557,9 +577,12 @@ async def print_imp_preflight(
 
 @app.post("/api/print-imp/run", dependencies=[Depends(require_auth)])
 async def print_imp_run(
-    front_files: List[UploadFile] = File(...),
+    front_files: Optional[List[UploadFile]] = File(None),
     back_file: Optional[UploadFile] = File(None),
     dieline_file: Optional[UploadFile] = File(None),
+    from_job_id: Optional[str] = Form(None),
+    from_front_filenames_json: Optional[str] = Form(None),
+    from_dieline_filename: Optional[str] = Form(None),
     sheet_w_mm: float = Form(500.0),
     sheet_h_mm: float = Form(350.0),
     trim_w_mm: Optional[str] = Form(None),
@@ -587,9 +610,25 @@ async def print_imp_run(
     fill_dir: str = Form("col"),
 ) -> Dict[str, Any]:
     try:
-        fronts = [(f.filename or "front.pdf", await f.read()) for f in front_files]
-        back = (back_file.filename or "back.pdf", await back_file.read()) if back_file else None
-        dieline = (dieline_file.filename or "dieline.pdf", await dieline_file.read()) if dieline_file else None
+        fronts: List[tuple[str, bytes]] = []
+        if from_job_id and from_front_filenames_json:
+            fnames = json.loads(from_front_filenames_json)
+            for fn in fnames:
+                p = get_job_output_file(from_job_id, fn)
+                fronts.append((p.name, p.read_bytes()))
+        for f in (front_files or []):
+            if f.filename:
+                fronts.append((f.filename, await f.read()))
+        if not fronts:
+            raise ValueError("Kamida bitta Oldi (Front) PDF fayl tanlang.")
+
+        back = (back_file.filename or "back.pdf", await back_file.read()) if (back_file and back_file.filename) else None
+        dieline = None
+        if dieline_file and dieline_file.filename:
+            dieline = (dieline_file.filename, await dieline_file.read())
+        elif from_job_id and from_dieline_filename:
+            dp = get_job_output_file(from_job_id, from_dieline_filename)
+            dieline = (dp.name, dp.read_bytes())
 
         tw = float(trim_w_mm) if (trim_w_mm and trim_w_mm.strip()) else None
         th = float(trim_h_mm) if (trim_h_mm and trim_h_mm.strip()) else None
@@ -630,3 +669,76 @@ async def print_imp_run(
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# 4. DESIGN & DIELINE EXTRACTOR ENDPOINTS
+# ---------------------------------------------------------------------------
+class ExtractorSearchSizeRequest(BaseModel):
+    source_job_id: str
+    width_mm: float
+    height_mm: float
+    tolerance_mm: float = 3.0
+    page_index: Optional[int] = None
+
+
+class ExtractorRunRequest(BaseModel):
+    source_job_id: str
+    items: List[Dict[str, Any]]
+    remove_border: bool = False
+    remove_hole: bool = False
+    bleed_mm: float = 0.0
+    rotation_deg: int = 0
+
+
+@app.post("/api/extractor/inspect", dependencies=[Depends(require_auth)])
+async def extractor_inspect(
+    file: UploadFile = File(...),
+    target_w_mm: Optional[str] = Form(None),
+    target_h_mm: Optional[str] = Form(None),
+) -> Dict[str, Any]:
+    try:
+        raw = await file.read()
+        tw = float(target_w_mm) if (target_w_mm and target_w_mm.strip()) else None
+        th = float(target_h_mm) if (target_h_mm and target_h_mm.strip()) else None
+        return await asyncio.to_thread(
+            extractor_service.inspect_pdf_for_extraction,
+            filename=file.filename or "document.pdf",
+            raw_bytes=raw,
+            target_w_mm=tw,
+            target_h_mm=th,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/extractor/search-size", dependencies=[Depends(require_auth)])
+async def extractor_search_size(body: ExtractorSearchSizeRequest) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            extractor_service.search_pdf_by_dimensions,
+            source_job_id=body.source_job_id,
+            width_mm=body.width_mm,
+            height_mm=body.height_mm,
+            tolerance_mm=body.tolerance_mm,
+            page_index=body.page_index,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/extractor/run", dependencies=[Depends(require_auth)])
+async def extractor_run(body: ExtractorRunRequest) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            extractor_service.run_extraction_job,
+            source_job_id=body.source_job_id,
+            items=body.items,
+            remove_border=body.remove_border,
+            remove_hole=body.remove_hole,
+            bleed_mm=body.bleed_mm,
+            rotation_deg=body.rotation_deg,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+

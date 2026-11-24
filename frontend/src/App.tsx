@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react"
 import { ThemeProvider } from "next-themes"
 
 import { AppSidebar, type TabKey } from "@/components/AppSidebar"
+import { ExtractorTab } from "@/components/ExtractorTab"
 import { GearsTab } from "@/components/GearsTab"
 import { LabelImpTab } from "@/components/LabelImpTab"
 import { LoginDialog } from "@/components/LoginDialog"
@@ -20,10 +21,12 @@ import {
   setUnauthorizedHandler,
   type AuthStatusResponse,
   type LabelHandoff,
+  type PrintHandoff,
 } from "@/lib/api"
 
 const TAB_TITLES: Record<TabKey, string> = {
   sela: "Sela Etiketka",
+  extractor: "Dizayn va Pichoq Ajratish",
   "label-imp": "Val Montaji",
   "print-imp": "Varaq Montaji",
   gears: "Vallar (Gears)",
@@ -35,6 +38,7 @@ export default function App() {
   const [authenticated, setAuthenticated] = useState(false)
   const [authChecked, setAuthChecked] = useState(false)
   const [labelHandoff, setLabelHandoff] = useState<LabelHandoff | null>(null)
+  const [printHandoff, setPrintHandoff] = useState<PrintHandoff | null>(null)
 
   const checkAuth = useCallback(async () => {
     try {
@@ -64,6 +68,11 @@ export default function App() {
     setActiveTab("label-imp")
   }
 
+  function handleSendToPrintImp(handoff: PrintHandoff) {
+    setPrintHandoff(handoff)
+    setActiveTab("print-imp")
+  }
+
   const appReady = authChecked && authenticated
 
   return (
@@ -91,13 +100,22 @@ export default function App() {
 
             <main
               className={`mx-auto w-full flex-1 p-4 md:p-6 ${
-                activeTab === "label-imp" ? "max-w-[1800px]" : "max-w-6xl"
+                activeTab === "label-imp" || activeTab === "extractor"
+                  ? "max-w-[1800px]"
+                  : "max-w-6xl"
               }`}
             >
               <div className={activeTab === "sela" ? "block" : "hidden"}>
                 <SelaTab
                   ready={appReady}
                   onSendToLabelImp={handleSendToLabelImp}
+                />
+              </div>
+
+              <div className={activeTab === "extractor" ? "block" : "hidden"}>
+                <ExtractorTab
+                  onSendToLabelImp={handleSendToLabelImp}
+                  onSendToPrintImp={handleSendToPrintImp}
                 />
               </div>
 
@@ -109,7 +127,11 @@ export default function App() {
               </div>
 
               <div className={activeTab === "print-imp" ? "block" : "hidden"}>
-                <PrintImpTab ready={appReady} />
+                <PrintImpTab
+                  ready={appReady}
+                  handoff={printHandoff}
+                  onClearHandoff={() => setPrintHandoff(null)}
+                />
               </div>
 
               <div className={activeTab === "gears" ? "block" : "hidden"}>

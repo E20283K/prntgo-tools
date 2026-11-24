@@ -5,11 +5,13 @@ import {
   Download,
   FolderUp,
   LayoutGrid,
+  Link2,
   Loader2,
   Play,
   ScanSearch,
   SlidersHorizontal,
   Wrench,
+  X,
 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -48,6 +50,7 @@ import {
   apiFetch,
   jobCdrBundleUrl,
   jobFileUrl,
+  type PrintHandoff,
   type PrintPreflightResponse,
   type PrintPreset,
   type PrintPresetsResponse,
@@ -56,6 +59,8 @@ import {
 
 interface PrintImpTabProps {
   ready: boolean
+  handoff?: PrintHandoff | null
+  onClearHandoff?: () => void
 }
 
 const PRINT_MODE_LABELS: Record<string, string> = {
@@ -79,7 +84,11 @@ const PRINT_STRATEGY_LABELS: Record<string, string> = {
   single: "1 ta formaga majburlash",
 }
 
-export function PrintImpTab({ ready }: PrintImpTabProps) {
+export function PrintImpTab({
+  ready,
+  handoff,
+  onClearHandoff,
+}: PrintImpTabProps) {
   const corel = useCorelSettings()
   const [presets, setPresets] = useState<Record<string, PrintPreset>>({})
   const [selectedPresetKey, setSelectedPresetKey] = useState<string>("")
@@ -152,9 +161,10 @@ export function PrintImpTab({ ready }: PrintImpTabProps) {
   async function executePreflight(
     files: File[],
     dieline: File | null,
-    options?: { silent?: boolean; forceTrim?: boolean }
+    options?: { silent?: boolean; forceTrim?: boolean; activeHandoff?: PrintHandoff | null }
   ) {
-    if (!files.length) {
+    const h = options?.activeHandoff !== undefined ? options.activeHandoff : handoff
+    if (!files.length && !h) {
       if (!options?.silent) {
         toast.error("Avval Oldi PDF faylni tanlang.")
       }
@@ -164,6 +174,16 @@ export function PrintImpTab({ ready }: PrintImpTabProps) {
     setPreflightLoading(true)
     try {
       const fd = new FormData()
+      if (h && files.length === 0) {
+        fd.append("from_job_id", h.job_id)
+        fd.append(
+          "from_front_filenames_json",
+          JSON.stringify(h.front_filenames)
+        )
+        if (h.dieline_filename && !dieline) {
+          fd.append("from_dieline_filename", h.dieline_filename)
+        }
+      }
       files.forEach((f) => fd.append("front_files", f))
       if (dieline) fd.append("dieline_file", dieline)
 
@@ -201,6 +221,26 @@ export function PrintImpTab({ ready }: PrintImpTabProps) {
     }
   }
 
+  useEffect(() => {
+    if (handoff) {
+      setFrontFiles([])
+      setDielineFile(null)
+      if (handoff.trim_w_mm && handoff.trim_h_mm) {
+        setTrimW(String(handoff.trim_w_mm))
+        setTrimH(String(handoff.trim_h_mm))
+      }
+      if (handoff.dieline_filename && presets["packaging_50x35"]) {
+        applyPreset("packaging_50x35", presets["packaging_50x35"])
+      }
+      void executePreflight([], null, {
+        silent: true,
+        forceTrim: true,
+        activeHandoff: handoff,
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [handoff])
+
   async function handlePreflight() {
     await executePreflight(frontFiles, dielineFile, {
       silent: false,
@@ -209,7 +249,7 @@ export function PrintImpTab({ ready }: PrintImpTabProps) {
   }
 
   async function handleRun() {
-    if (!frontFiles.length) {
+    if (!frontFiles.length && !handoff) {
       toast.error("Avval Oldi PDF faylni tanlang.")
       return
     }
@@ -217,6 +257,16 @@ export function PrintImpTab({ ready }: PrintImpTabProps) {
     try {
       const selectedPreset = presets[selectedPresetKey]
       const fd = new FormData()
+      if (handoff && frontFiles.length === 0) {
+        fd.append("from_job_id", handoff.job_id)
+        fd.append(
+          "from_front_filenames_json",
+          JSON.stringify(handoff.front_filenames)
+        )
+        if (handoff.dieline_filename && !dielineFile) {
+          fd.append("from_dieline_filename", handoff.dieline_filename)
+        }
+      }
       frontFiles.forEach((f) => fd.append("front_files", f))
       if (backFile) fd.append("back_file", backFile)
       if (dielineFile) fd.append("dieline_file", dielineFile)
@@ -272,6 +322,34 @@ export function PrintImpTab({ ready }: PrintImpTabProps) {
           Vizitka, flayer, qadoqlash (pichoqli) va ko'p dizaynli to'plamlar uchun 100% vektorli varaq montaji.
         </p>
       </div>
+
+      {handoff && (
+        <Alert>
+          <Link2 />
+          <AlertTitle>Dizayn Ajratish xizmati natijasi ulandi</AlertTitle>
+          <AlertDescription className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <span>
+              Oldi dizaynlar: {handoff.front_filenames.join(", ")}
+              {handoff.dieline_filename
+                ? ` | Pichoq (Dieline): ${handoff.dieline_filename}`
+                : ""}
+            </span>
+            {onClearHandoff && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  onClearHandoff()
+                  setPreflight(null)
+                }}
+              >
+                <X />
+                <span>Bekor qilish</span>
+              </Button>
+            )}
+          </AlertDescription>
+        </Alert>
+      )}
 
       {/* Step 1: Files & Preflight */}
       <Card>
@@ -698,9 +776,15 @@ export function PrintImpTab({ ready }: PrintImpTabProps) {
             waste={Number(waste)}
             orderNo={orderNo}
             jobName={jobName}
-            variantNames={frontFiles.map((f) => f.name.replace(/\.pdf$/i, ""))}
+            variantNames={
+              frontFiles.length > 0
+                ? frontFiles.map((f) => f.name.replace(/\.pdf$/i, ""))
+                : (handoff?.front_filenames.map((fn) =>
+                    fn.replace(/\.pdf$/i, "")
+                  ) ?? [])
+            }
             preflightLoading={preflightLoading}
-            hasFrontFiles={frontFiles.length > 0}
+            hasFrontFiles={frontFiles.length > 0 || Boolean(handoff)}
           />
 
           <Button size="lg" onClick={() => void handleRun()} disabled={running}>

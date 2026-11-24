@@ -45,6 +45,100 @@ export interface LabelHandoff {
   job_id: string
   filename: string
   total_labels: number
+  source_label?: string
+}
+
+export interface PrintHandoff {
+  job_id: string
+  front_filenames: string[]
+  dieline_filename?: string | null
+  trim_w_mm?: number | null
+  trim_h_mm?: number | null
+  source_label?: string
+}
+
+export interface ExtractorHoleInfo {
+  center_x_mm: number
+  center_y_mm: number
+  diameter_mm: number
+}
+
+export interface ExtractorCandidate {
+  id: string
+  page_index: number
+  role: "design" | "dieline"
+  label: string
+  bbox_mm: [number, number, number, number]
+  width_mm: number
+  height_mm: number
+  has_outer_border: boolean
+  has_fill: boolean
+  fill_color_hex?: string | null
+  interior_paths_count: number
+  interior_texts_count: number
+  has_hole: boolean
+  holes_count: number
+  holes: ExtractorHoleInfo[]
+  confidence: number
+  matches_text_hint: boolean
+  selected_by_default: boolean
+}
+
+export interface ExtractorPageMeta {
+  page_index: number
+  page_number: number
+  width_mm: number
+  height_mm: number
+  preview_file: string
+  preview_px: [number, number]
+  dimension_hints: Array<[number, number]>
+  candidates_count: number
+  designs_count: number
+  dielines_count: number
+}
+
+export interface ExtractorInspectResponse {
+  source_job_id: string
+  filename: string
+  page_count: number
+  pages: ExtractorPageMeta[]
+  candidates: ExtractorCandidate[]
+}
+
+export interface ExtractorExtractedItem {
+  index: number
+  id: string
+  label: string
+  role: "design" | "dieline"
+  page_index: number
+  width_mm: number
+  height_mm: number
+  bleed_mm: number
+  filename: string
+  thumb_file: string
+  size_kb: number
+}
+
+export interface ExtractorOutputFileItem extends OutputFileItem {
+  role?: string
+  width_mm?: number
+  height_mm?: number
+  thumb_file?: string | null
+}
+
+export interface ExtractorRunResponse {
+  job_id: string
+  source_job_id: string
+  source_filename: string
+  items_count: number
+  items: ExtractorExtractedItem[]
+  output_files: ExtractorOutputFileItem[]
+  design_files: string[]
+  dieline_files: string[]
+  combined_designs_file?: string | null
+  combined_all_file?: string | null
+  primary_design_file: string
+  zip_file?: string | null
 }
 
 export interface LabelInspectDesign {

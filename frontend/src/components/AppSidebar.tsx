@@ -3,6 +3,7 @@ import {
   Cylinder,
   LayoutGrid,
   LogOut,
+  Scissors,
   Tag,
 } from "lucide-react"
 
@@ -23,7 +24,7 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar"
 
-export type TabKey = "sela" | "label-imp" | "print-imp" | "gears"
+export type TabKey = "sela" | "extractor" | "label-imp" | "print-imp" | "gears"
 
 interface AppSidebarProps {
   activeTab: TabKey
@@ -85,6 +86,16 @@ export function AppSidebar({
           <SidebarGroupLabel>Ofset va raqamli bosma</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  isActive={activeTab === "extractor"}
+                  tooltip="Dizayn Ajratish"
+                  onClick={() => onSelectTab("extractor")}
+                >
+                  <Scissors />
+                  <span>Dizayn Ajratish</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
               <SidebarMenuItem>
                 <SidebarMenuButton
                   isActive={activeTab === "print-imp"}
