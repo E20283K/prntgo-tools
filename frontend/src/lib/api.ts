@@ -48,6 +48,7 @@ export interface LabelHandoff {
 }
 
 export interface LabelInspectDesign {
+  index?: number
   display_name: string
   width_mm: number
   length_mm: number

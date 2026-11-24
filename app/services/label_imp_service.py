@@ -186,6 +186,7 @@ def preview_label_imposition_pdf(
     regmark_custom_width_mm: Optional[float] = None,
     column_gap_mm: float = 5.0,
     max_cylinder_width_mm: float = 0.0,
+    design_index: Optional[int] = None,
 ) -> Tuple[bytes, int]:
     """
     Runs label imposition in a temporary directory and returns (pdf_bytes, page_count)
@@ -209,9 +210,7 @@ def preview_label_imposition_pdf(
             safe = Path(fname).name
             if not safe.lower().endswith(".pdf"):
                 continue
-            dst = inputs_dir / safe
-            if dst.exists():
-                dst = inputs_dir / f"{idx:02d}_{safe}"
+            dst = inputs_dir / f"{idx:02d}_{safe}"
             dst.write_bytes(raw)
             input_paths.append(dst)
 
@@ -236,7 +235,23 @@ def preview_label_imposition_pdf(
         gm = _get_gear_manager()
         engine = ImpositionEngine(gm)
 
-        if combine_same_gear:
+        if design_index is not None:
+            all_designs = []
+            for p in input_paths:
+                all_designs.extend(inspect_pdf_designs(p))
+            if not all_designs:
+                raise ValueError("Stiker dizaynlari topilmadi.")
+            chosen_idx = max(0, min(design_index, len(all_designs) - 1))
+            results = [
+                engine.process_design_info(
+                    all_designs[chosen_idx],
+                    output_dir=outputs_dir,
+                    config=config,
+                    custom_gear=custom_gear,
+                    custom_copies=custom_copies,
+                )
+            ]
+        elif combine_same_gear:
             overrides = {str(p): (custom_gear, custom_copies) for p in input_paths}
             results = engine.process_batch_combined_by_gear(
                 input_paths,

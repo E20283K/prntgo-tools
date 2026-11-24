@@ -87,6 +87,7 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
   const [files, setFiles] = useState<File[]>([])
   const [dragOver, setDragOver] = useState(false)
   const [inspected, setInspected] = useState<LabelInspectDesign[]>([])
+  const [selectedDesignIndex, setSelectedDesignIndex] = useState<number>(0)
 
   const [customGear, setCustomGear] = useState("")
   const [customCopies, setCustomCopies] = useState("")
@@ -153,6 +154,9 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
       })
       const data: LabelInspectResponse = await res.json()
       setInspected(data.designs)
+      setSelectedDesignIndex((prev) =>
+        data.designs.length === 0 ? 0 : Math.min(prev, data.designs.length - 1)
+      )
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Tekshirishda xatolik")
     }
@@ -192,6 +196,7 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
     }
     fd.append("column_gap_mm", gapMm)
     fd.append("max_cylinder_width_mm", maxWidthMm)
+    fd.append("design_index", String(selectedDesignIndex))
 
     try {
       const res = await apiFetch("/api/label-imp/preview", {
@@ -234,18 +239,21 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
     regWidthMm,
     gapMm,
     maxWidthMm,
+    selectedDesignIndex,
     clearPreview,
   ])
 
   useEffect(() => {
     if (handoff) {
       setFiles([])
+      setSelectedDesignIndex(0)
     }
   }, [handoff])
 
   useEffect(() => {
     if (!hasSource) {
       setInspected([])
+      setSelectedDesignIndex(0)
       return
     }
     const timer = window.setTimeout(() => {
@@ -276,12 +284,13 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
     const pdfs = incoming.filter((f) => f.name.toLowerCase().endsWith(".pdf"))
     if (!pdfs.length) return
     setFiles(pdfs)
+    setSelectedDesignIndex(0)
   }
 
   function handleQuickRotate90() {
     const currentDeg =
       rotationMode === "auto"
-        ? (inspected[0]?.rotation_deg ?? 0)
+        ? ((inspected[selectedDesignIndex] ?? inspected[0])?.rotation_deg ?? 0)
         : parseInt(rotationMode, 10) || 0
     const nextDeg = (currentDeg + 90) % 360
     setRotationMode(String(nextDeg))
@@ -430,10 +439,12 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
 
             {inspected.length > 0 && (
               <div className="space-y-2">
-                <div className="text-xs font-medium text-muted-foreground">
-                  Aniqlangan stikerlar va tavsiya etilgan Val
+                <div className="flex items-center justify-between gap-2 text-xs font-medium text-muted-foreground">
+                  <span>
+                    Aniqlangan stikerlar ({inspected.length} ta) — oldindan ko'rish uchun ustiga bosing
+                  </span>
                 </div>
-                <div className="rounded-lg border">
+                <div className="max-h-[420px] overflow-y-auto rounded-lg border">
                   <Table>
                     <TableHeader>
                       <TableRow>
@@ -444,44 +455,53 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {inspected.slice(0, 12).map((d, i) => (
-                        <TableRow key={`${d.display_name}-${i}`}>
-                          <TableCell>{d.display_name}</TableCell>
-                          <TableCell className="tabular-nums">
-                            <span className="inline-flex items-center gap-1.5">
-                              <span>
-                                {d.width_mm} × {d.length_mm} mm
-                              </span>
-                              {d.rotation_deg ? (
-                                <Badge
-                                  variant="outline"
-                                  className="px-1.5 py-0 text-[10px] font-normal text-muted-foreground"
-                                >
-                                  {d.rotation_deg}°
-                                </Badge>
-                              ) : null}
-                            </span>
-                          </TableCell>
-                          <TableCell>
-                            <Badge variant="secondary" className="tabular-nums">
-                              {d.recommended_gear ?? "-"} val
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="tabular-nums">
-                            {d.recommended_copies ?? "-"}x
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                      {inspected.length > 12 && (
-                        <TableRow>
-                          <TableCell
-                            colSpan={4}
-                            className="text-muted-foreground"
+                      {inspected.map((d, i) => {
+                        const isSelected = i === selectedDesignIndex
+                        return (
+                          <TableRow
+                            key={`${d.display_name}-${i}`}
+                            data-state={isSelected ? "selected" : undefined}
+                            onClick={() => setSelectedDesignIndex(i)}
+                            className={`cursor-pointer transition-colors ${
+                              isSelected
+                                ? "bg-primary/10 font-medium hover:bg-primary/15"
+                                : "hover:bg-muted/60"
+                            }`}
                           >
-                            ... va yana {inspected.length - 12} ta stiker
-                          </TableCell>
-                        </TableRow>
-                      )}
+                            <TableCell>
+                              <span className="inline-flex items-center gap-1.5">
+                                {isSelected && (
+                                  <Eye className="size-3.5 shrink-0 text-primary" />
+                                )}
+                                <span className="truncate">{d.display_name}</span>
+                              </span>
+                            </TableCell>
+                            <TableCell className="tabular-nums">
+                              <span className="inline-flex items-center gap-1.5">
+                                <span>
+                                  {d.width_mm} × {d.length_mm} mm
+                                </span>
+                                {d.rotation_deg ? (
+                                  <Badge
+                                    variant="outline"
+                                    className="px-1.5 py-0 text-[10px] font-normal text-muted-foreground"
+                                  >
+                                    {d.rotation_deg}°
+                                  </Badge>
+                                ) : null}
+                              </span>
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="secondary" className="tabular-nums">
+                                {d.recommended_gear ?? "-"} val
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="tabular-nums">
+                              {d.recommended_copies ?? "-"}x
+                            </TableCell>
+                          </TableRow>
+                        )
+                      })}
                     </TableBody>
                   </Table>
                 </div>
@@ -767,9 +787,14 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
         {/* Live Pre-Generation Preview Card */}
         <Card className="lg:col-span-2 xl:sticky xl:top-16 xl:col-span-1 xl:self-start">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
+            <CardTitle className="flex flex-wrap items-center gap-2">
               <Eye className="size-4 text-muted-foreground" />
-              Jonli ko'rinish (Montajdan oldin)
+              <span>Jonli ko'rinish (Montajdan oldin)</span>
+              {inspected[selectedDesignIndex] && (
+                <Badge variant="outline" className="max-w-[240px] truncate font-normal">
+                  {inspected[selectedDesignIndex].display_name}
+                </Badge>
+              )}
               {previewUrl && previewPages > 1 && (
                 <Badge variant="secondary" className="tabular-nums">
                   {previewPages} ta sahifa
@@ -825,9 +850,11 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
                 <PdfPreview
                   src={previewUrl}
                   title={
-                    previewPages > 1
-                      ? `Val Montaji — Oldindan ko'rish (${previewPages} ta sahifa)`
-                      : "Val Montaji — Oldindan ko'rish"
+                    inspected[selectedDesignIndex]
+                      ? `Val Montaji — ${inspected[selectedDesignIndex].display_name}`
+                      : previewPages > 1
+                        ? `Val Montaji — Oldindan ko'rish (${previewPages} ta sahifa)`
+                        : "Val Montaji — Oldindan ko'rish"
                   }
                   iframeClassName="h-[540px] xl:h-[calc(100vh-14rem)] xl:min-h-[540px]"
                 />

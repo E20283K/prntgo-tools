@@ -366,6 +366,7 @@ async def label_imp_preview(
     regmark_custom_width_mm: Optional[str] = Form(None),
     column_gap_mm: float = Form(5.0),
     max_cylinder_width_mm: float = Form(0.0),
+    design_index: Optional[str] = Form(None),
 ) -> Response:
     try:
         uploaded: List[tuple[str, bytes]] = []
@@ -376,6 +377,7 @@ async def label_imp_preview(
         gear_val = int(custom_gear) if (custom_gear and custom_gear.strip().isdigit()) else None
         copies_val = int(custom_copies) if (custom_copies and custom_copies.strip().isdigit()) else None
         rm_w = float(regmark_custom_width_mm) if (regmark_custom_width_mm and regmark_custom_width_mm.strip()) else None
+        d_idx = int(design_index) if (design_index is not None and design_index.strip().isdigit()) else None
 
         pdf_bytes, page_count = await asyncio.to_thread(
             label_imp_service.preview_label_imposition_pdf,
@@ -395,6 +397,7 @@ async def label_imp_preview(
             regmark_custom_width_mm=rm_w,
             column_gap_mm=column_gap_mm,
             max_cylinder_width_mm=max_cylinder_width_mm,
+            design_index=d_idx,
         )
         return Response(
             content=pdf_bytes,
