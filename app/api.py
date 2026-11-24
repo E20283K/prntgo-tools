@@ -25,6 +25,12 @@ from app.auth import (
     verify_session_token,
 )
 from app.config import JOB_CLEANUP_INTERVAL_MINUTES, SESSION_COOKIE_NAME
+from app.corel_converter import (
+    COREL_VERSIONS,
+    DEFAULT_COREL_VERSION,
+    build_cdr_bundle_zip,
+    build_standalone_converter_zip,
+)
 from app.jobs import cleanup_old_jobs, get_job_output_file
 from app.services import label_imp_service, print_imp_service, sela_service
 
@@ -148,6 +154,60 @@ def download_job_file(job_id: str, filename: str, inline: bool = Query(False)) -
             headers={"Content-Disposition": f'inline; filename="{path.name}"'},
         )
     return FileResponse(str(path), media_type=media_type, filename=path.name)
+
+
+# ---------------------------------------------------------------------------
+# CorelDRAW (.cdr) Auto-Converter & Bundle Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/api/corel/versions", dependencies=[Depends(require_auth)])
+def corel_versions() -> Dict[str, Any]:
+    return {
+        "default_version": DEFAULT_COREL_VERSION,
+        "versions": COREL_VERSIONS,
+    }
+
+
+@app.get("/api/jobs/{job_id}/cdr-bundle", dependencies=[Depends(require_auth)])
+def download_job_cdr_bundle(
+    job_id: str,
+    filename: Optional[str] = Query(None),
+    version: int = Query(DEFAULT_COREL_VERSION, ge=12, le=26),
+    ask: bool = Query(False),
+) -> Response:
+    try:
+        zip_bytes, zip_name = build_cdr_bundle_zip(
+            job_id=job_id,
+            filename=filename,
+            target_version=version,
+            ask_version=ask,
+            keep_open_in_corel=True,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
+
+
+@app.get("/api/corel/standalone-converter", dependencies=[Depends(require_auth)])
+def download_standalone_cdr_converter(
+    version: int = Query(DEFAULT_COREL_VERSION, ge=12, le=26),
+    ask: bool = Query(False),
+) -> Response:
+    zip_bytes, zip_name = build_standalone_converter_zip(
+        target_version=version,
+        ask_version=ask,
+    )
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -200,3 +200,31 @@ export function selaSetPreviewUrl(filename: string): string {
 export function selaSetPreviewImgUrl(filename: string, dpi = 150): string {
   return `/api/sela/set-preview/${encodeURIComponent(filename)}?format=png&dpi=${dpi}`
 }
+
+export interface CorelExportOptions {
+  filename?: string
+  version?: number
+  ask?: boolean
+}
+
+export function jobCdrBundleUrl(
+  jobId: string,
+  options: CorelExportOptions = {}
+): string {
+  const params = new URLSearchParams()
+  if (options.filename) params.set("filename", options.filename)
+  params.set("version", String(options.version ?? 18))
+  if (options.ask) params.set("ask", "true")
+  return `/api/jobs/${encodeURIComponent(jobId)}/cdr-bundle?${params.toString()}`
+}
+
+export function standaloneCdrConverterUrl(
+  version = 18,
+  ask = false
+): string {
+  const params = new URLSearchParams()
+  params.set("version", String(version))
+  if (ask) params.set("ask", "true")
+  return `/api/corel/standalone-converter?${params.toString()}`
+}
+

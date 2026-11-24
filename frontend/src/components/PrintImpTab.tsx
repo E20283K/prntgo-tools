@@ -41,10 +41,12 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Switch } from "@/components/ui/switch"
+import { CorelExportBar, useCorelSettings } from "@/components/CorelExportBar"
 import { PdfPreview } from "@/components/PdfPreview"
 import { PrintImpSvgPreview } from "@/components/PrintImpSvgPreview"
 import {
   apiFetch,
+  jobCdrBundleUrl,
   jobFileUrl,
   type PrintPreflightResponse,
   type PrintPreset,
@@ -78,6 +80,7 @@ const PRINT_STRATEGY_LABELS: Record<string, string> = {
 }
 
 export function PrintImpTab({ ready }: PrintImpTabProps) {
+  const corel = useCorelSettings()
   const [presets, setPresets] = useState<Record<string, PrintPreset>>({})
   const [selectedPresetKey, setSelectedPresetKey] = useState<string>("")
 
@@ -745,26 +748,58 @@ export function PrintImpTab({ ready }: PrintImpTabProps) {
               </AlertTitle>
             </Alert>
 
+            <CorelExportBar
+              jobId={result.job_id}
+              version={corel.version}
+              onVersionChange={corel.setVersion}
+              askOnRun={corel.askOnRun}
+              onAskOnRunChange={corel.setAskOnRun}
+            />
+
             <div className="flex flex-wrap gap-2">
-              {result.output_files.map((f) => (
-                <Button
-                  key={f.filename}
-                  variant="outline"
-                  size="sm"
-                  nativeButton={false}
-                  render={
-                    <a
-                      href={jobFileUrl(result.job_id, f.filename)}
-                      download={f.filename}
-                    />
-                  }
-                >
-                  <Download />
-                  <span>
-                    {f.filename} ({f.size_kb} KB)
-                  </span>
-                </Button>
-              ))}
+              {result.output_files.map((f) => {
+                const isPdf = f.filename.toLowerCase().endsWith(".pdf")
+                return (
+                  <div key={f.filename} className="inline-flex items-center gap-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      nativeButton={false}
+                      render={
+                        <a
+                          href={jobFileUrl(result.job_id, f.filename)}
+                          download={f.filename}
+                        />
+                      }
+                    >
+                      <Download />
+                      <span>
+                        {f.filename} ({f.size_kb} KB)
+                      </span>
+                    </Button>
+                    {isPdf && result.output_files.length > 1 && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        title={`${f.filename} faylini CorelDRAW (.cdr v${corel.version}) avto-konverteri bilan yuklab olish`}
+                        nativeButton={false}
+                        render={
+                          <a
+                            href={jobCdrBundleUrl(result.job_id, {
+                              filename: f.filename,
+                              version: corel.version,
+                              ask: corel.askOnRun,
+                            })}
+                            download
+                          />
+                        }
+                      >
+                        <span>.CDR (v{corel.version})</span>
+                      </Button>
+                    )}
+                  </div>
+                )
+              })}
             </div>
 
             {(() => {

@@ -63,6 +63,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { CorelExportBar, useCorelSettings } from "@/components/CorelExportBar"
 import { PdfPreview } from "@/components/PdfPreview"
 import {
   apiFetch,
@@ -94,6 +95,7 @@ const SET_MODE_LABELS: Record<string, string> = {
 }
 
 export function SelaTab({ ready, onSendToLabelImp }: SelaTabProps) {
+  const corel = useCorelSettings()
   const [config, setConfig] = useState<SelaConfigResponse | null>(null)
   const [templateName, setTemplateName] = useState<string>("")
   const [orientation, setOrientation] = useState<string>("portrait")
@@ -970,6 +972,15 @@ export function SelaTab({ ready, onSendToLabelImp }: SelaTabProps) {
                 </div>
               </AlertDescription>
             </Alert>
+
+            <CorelExportBar
+              jobId={result.job_id}
+              filename={result.output_file}
+              version={corel.version}
+              onVersionChange={corel.setVersion}
+              askOnRun={corel.askOnRun}
+              onAskOnRunChange={corel.setAskOnRun}
+            />
 
             <PdfPreview
               src={jobFileUrl(result.job_id, result.output_file, true)}

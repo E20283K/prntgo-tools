@@ -13,6 +13,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -23,6 +24,7 @@ from aiogram.types import (
 )
 
 from app.config import PUBLIC_URL, get_allowed_telegram_ids
+from app.corel_converter import build_cdr_bundle_zip
 from app.jobs import get_job_output_file
 from app.services import label_imp_service, print_imp_service, sela_service
 
@@ -102,6 +104,24 @@ def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="menu:home")]]
     )
+
+
+def cdr_result_kb(job_id: str) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="🟢 CorelDRAW (.cdr v18 / X8) Paket",
+                callback_data=f"cdr:{job_id}:18:0",
+            )
+        ],
+        [
+            InlineKeyboardButton(text="CDR v17 (X7)", callback_data=f"cdr:{job_id}:17:0"),
+            InlineKeyboardButton(text="CDR v15 (X5)", callback_data=f"cdr:{job_id}:15:0"),
+            InlineKeyboardButton(text="CDR (So'rash)", callback_data=f"cdr:{job_id}:18:1"),
+        ],
+        [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="menu:home")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------------------------------------------------------------------------
@@ -411,12 +431,13 @@ async def _send_label_imp_result(target_msg: Message, wait_msg: Message, res: Di
         lines.append(f"... jami {len(res['designs'])} ta dizayn")
 
     await wait_msg.delete()
+    kb = cdr_result_kb(res["job_id"])
     if res.get("zip_file"):
         zp = get_job_output_file(res["job_id"], res["zip_file"])
         await target_msg.answer_document(
             FSInputFile(str(zp)),
             caption="\n".join(lines),
-            reply_markup=main_menu_kb(),
+            reply_markup=kb,
         )
     else:
         for f in res["output_files"]:
@@ -424,7 +445,7 @@ async def _send_label_imp_result(target_msg: Message, wait_msg: Message, res: Di
             await target_msg.answer_document(
                 FSInputFile(str(fp)),
                 caption="\n".join(lines),
-                reply_markup=main_menu_kb(),
+                reply_markup=kb,
             )
 
 
@@ -592,11 +613,39 @@ async def _finish_print_imp(target_msg: Message, state: FSMContext, qty: int) ->
         await target_msg.answer_document(
             FSInputFile(str(out_path)),
             caption=caption,
-            reply_markup=main_menu_kb(),
+            reply_markup=cdr_result_kb(res["job_id"]),
         )
         await state.clear()
     except Exception as e:
         await wait_msg.edit_text(f"❌ Xatolik: {e}", reply_markup=cancel_kb())
+
+
+@router.callback_query(F.data.startswith("cdr:"))
+async def cb_send_cdr_bundle(call: CallbackQuery) -> None:
+    try:
+        _, job_id, ver_str, ask_str = call.data.split(":", 3)
+        version = int(ver_str)
+        ask_flag = ask_str == "1"
+        await call.answer(f"CDR (v{version}) paket tayyorlanmoqda...")
+        zip_bytes, zip_name = await asyncio.to_thread(
+            build_cdr_bundle_zip,
+            job_id=job_id,
+            target_version=version,
+            ask_version=ask_flag,
+        )
+        mode_note = f"versiyani so'raydi (standart: v{version})" if ask_flag else f"Version {version}"
+        await call.message.answer_document(
+            BufferedInputFile(zip_bytes, filename=zip_name),
+            caption=(
+                f"🟢 <b>CorelDRAW (.cdr) Avto-Konverter Paketi ({mode_note})</b>\n\n"
+                f"1️⃣ ZIP arxivni kompyuterda papkaga chiqaring.\n"
+                f"2️⃣ Ichidagi <code>1_Bosishda_CDR_v{version}_Qilish.vbs</code> faylini 2 marta bosing — "
+                f"CorelDRAW avtomatik ochilib, <b>.cdr (v{version})</b> faylni saqlab beradi!"
+            ),
+            reply_markup=main_menu_kb(),
+        )
+    except Exception as e:
+        await call.message.answer(f"❌ CDR paket yaratishda xatolik: {e}")
 
 
 @router.callback_query(PrintImpStates.waiting_qty, F.data.startswith("pqty:"))
