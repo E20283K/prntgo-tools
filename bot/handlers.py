@@ -26,7 +26,7 @@ from aiogram.types import (
 from app.config import PUBLIC_URL, get_allowed_telegram_ids
 from app.corel_converter import build_cdr_bundle_zip
 from app.jobs import get_job_output_file
-from app.services import label_imp_service, print_imp_service, sela_service
+from app.services import claude_design_service, label_imp_service, print_imp_service, sela_service
 
 router = Router()
 
@@ -86,6 +86,11 @@ class PrintImpStates(StatesGroup):
     waiting_qty = State()
 
 
+class AiDesignStates(StatesGroup):
+    waiting_size = State()
+    waiting_prompt = State()
+
+
 # ---------------------------------------------------------------------------
 # Keyboards
 # ---------------------------------------------------------------------------
@@ -94,6 +99,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🏷️ Sela Etiketka (1-qadam)", callback_data="menu:sela")],
         [InlineKeyboardButton(text="⚙️ Stiker Val Montaji (2-qadam)", callback_data="menu:label_imp")],
         [InlineKeyboardButton(text="📄 Varaq Montaji (Ofset/Raqamli)", callback_data="menu:print_imp")],
+        [InlineKeyboardButton(text="✨ AI Dizayn (Claude + VectorCraft)", callback_data="menu:ai_design")],
     ]
     if PUBLIC_URL.startswith("https://"):
         rows.append([InlineKeyboardButton(text="🌐 Web Ilovani Ochish", web_app=WebAppInfo(url=PUBLIC_URL))])
@@ -661,3 +667,182 @@ async def print_got_qty(message: Message, state: FSMContext) -> None:
         await message.answer("Iltimos, musbat son kiriting (masalan: 2000):")
         return
     await _finish_print_imp(message, state, int(message.text.strip()))
+
+
+# ---------------------------------------------------------------------------
+# 4. AI DESIGN (CLAUDE CODE + VECTORCRAFT MCP) FLOW
+# ---------------------------------------------------------------------------
+@router.callback_query(F.data == "menu:ai_design")
+@router.message(Command("ai"))
+async def cb_ai_design_start(event: Message | CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    skills = claude_design_service.list_skills()
+    assets = claude_design_service.list_assets()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="60×40 mm (Etiketka)", callback_data="ai_size:60:40"),
+                InlineKeyboardButton(text="50×90 mm (Birka)", callback_data="ai_size:50:90"),
+            ],
+            [
+                InlineKeyboardButton(text="80×50 mm (Stiker)", callback_data="ai_size:80:50"),
+                InlineKeyboardButton(text="50×50 mm (Kvadrat)", callback_data="ai_size:50:50"),
+            ],
+            [InlineKeyboardButton(text="📐 Erkin o'lcham (Matnda yozaman)", callback_data="ai_size:0:0")],
+            [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="menu:home")],
+        ]
+    )
+    text = (
+        f"✨ <b>AI Dizayn Studio (Claude Code + VectorCraft MCP)</b>\n"
+        f"• Faol skillar: <b>{len(skills)} ta</b>\n"
+        f"• Serverdagi fayllar (Assets): <b>{len(assets)} ta</b>\n\n"
+        f"1/2 — Dizayn o'lchamini tanlang (yoki <code>60x40</code> shaklida yozib yuboring):"
+    )
+    await state.set_state(AiDesignStates.waiting_size)
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text, reply_markup=kb)
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=kb)
+
+
+@router.callback_query(AiDesignStates.waiting_size, F.data.startswith("ai_size:"))
+async def cb_ai_got_size(call: CallbackQuery, state: FSMContext) -> None:
+    _, w_str, h_str = call.data.split(":", 2)
+    w_mm = float(w_str) if float(w_str) > 0 else None
+    h_mm = float(h_str) if float(h_str) > 0 else None
+    await state.update_data(width_mm=w_mm, height_mm=h_mm)
+    await state.set_state(AiDesignStates.waiting_prompt)
+    size_label = f"{w_mm:g}×{h_mm:g} mm" if (w_mm and h_mm) else "Erkin o'lcham"
+    await call.message.edit_text(
+        f"✨ Tanlangan o'lcham: <b>{size_label}</b>\n\n"
+        f"2/2 — <b>Dizayn topshirig'ini (TZ) yozib yuboring</b>\n"
+        f"(Xohlasangiz rasm, skrinshot yoki faylga izoh (caption) qilib yuborishingiz ham mumkin):",
+        reply_markup=cancel_kb(),
+    )
+    await call.answer()
+
+
+@router.message(AiDesignStates.waiting_size)
+async def msg_ai_got_custom_size(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").lower().replace("mm", "").replace("×", "x").replace("*", "x").strip()
+    if "x" in raw:
+        parts = raw.split("x", 1)
+        try:
+            w_mm = float(parts[0].strip())
+            h_mm = float(parts[1].strip())
+            await state.update_data(width_mm=w_mm, height_mm=h_mm)
+            await state.set_state(AiDesignStates.waiting_prompt)
+            await message.answer(
+                f"✨ O'lcham: <b>{w_mm:g}×{h_mm:g} mm</b>\n\n"
+                f"2/2 — <b>Dizayn topshirig'ini (TZ) yozib yuboring:</b>",
+                reply_markup=cancel_kb(),
+            )
+            return
+        except ValueError:
+            pass
+    # If the user directly typed a prompt instead of size, run directly!
+    await state.update_data(width_mm=None, height_mm=None)
+    await _run_bot_ai_design(message, state)
+
+
+@router.message(AiDesignStates.waiting_prompt)
+async def msg_ai_got_prompt(message: Message, state: FSMContext) -> None:
+    await _run_bot_ai_design(message, state)
+
+
+async def _run_bot_ai_design(message: Message, state: FSMContext) -> None:
+    prompt_text = (message.text or message.caption or "").strip()
+    if not prompt_text:
+        await message.answer("Iltimos, dizayn topshirig'ini matn sifatida yozing:")
+        return
+
+    data = await state.get_data()
+    w_mm = data.get("width_mm")
+    h_mm = data.get("height_mm")
+
+    uploaded_files: list[tuple[str, bytes]] = []
+    if message.document:
+        buf = io.BytesIO()
+        await message.bot.download(message.document, destination=buf)
+        uploaded_files.append((message.document.file_name or "input.bin", buf.getvalue()))
+    elif message.photo:
+        photo = message.photo[-1]
+        buf = io.BytesIO()
+        await message.bot.download(photo, destination=buf)
+        uploaded_files.append((f"photo_{photo.file_unique_id}.jpg", buf.getvalue()))
+
+    skills = [s["slug"] for s in claude_design_service.list_skills()]
+    assets = [a["name"] for a in claude_design_service.list_assets()]
+
+    wait_msg = await message.answer(
+        "⏳ <b>Claude Code + VectorCraft MCP ishlamoqda...</b>\n"
+        "Maxsus skillar asosida <code>.vectorcraft</code> va <code>.pdf</code> dizayn chizilmoqda (30-90 soniya olishi mumkin)."
+    )
+
+    try:
+        res = await asyncio.to_thread(
+            claude_design_service.run_ai_design_job,
+            prompt=prompt_text,
+            skill_slugs=skills,
+            asset_names=assets,
+            width_mm=w_mm,
+            height_mm=h_mm,
+            output_basename="ai_design",
+            uploaded_files=uploaded_files,
+        )
+        await wait_msg.delete()
+
+        job_id = res["job_id"]
+        vc_file = res.get("vectorcraft_file")
+        pdf_file = res.get("pdf_file")
+        reply_summary = (res.get("assistant_reply") or "").strip()
+        if len(reply_summary) > 650:
+            reply_summary = reply_summary[:650] + "..."
+
+        # 1. Send .vectorcraft file if present
+        if vc_file:
+            vc_path = get_job_output_file(job_id, vc_file)
+            await message.answer_document(
+                FSInputFile(str(vc_path)),
+                caption=f"🎨 <b>VectorCraft standart fayli:</b> <code>{vc_file}</code>",
+            )
+
+        # 2. Send .pdf file with Val Montaji & CorelDRAW (.cdr) buttons
+        if pdf_file:
+            pdf_path = get_job_output_file(job_id, pdf_file)
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⚙️ Val Montajiga joylashtirish →",
+                            callback_data=f"handoff:{job_id}:{pdf_file}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="🟢 CorelDRAW (.cdr v18 / X8) Paket",
+                            callback_data=f"cdr:{job_id}:18:0",
+                        )
+                    ],
+                    [InlineKeyboardButton(text="🏠 Bosh menyu", callback_data="menu:home")],
+                ]
+            )
+            await message.answer_document(
+                FSInputFile(str(pdf_path)),
+                caption=(
+                    f"✅ <b>AI Dizayn PDF tayyor!</b> ({res.get('duration_sec', 0)} s)\n\n"
+                    + (f"💬 <b>Claude hisoboti:</b>\n{reply_summary}" if reply_summary else "")
+                ),
+                reply_markup=kb,
+            )
+        else:
+            await message.answer(
+                f"ℹ️ <b>Claude javobi:</b>\n{reply_summary or 'Fayl yaratilmadi.'}",
+                reply_markup=main_menu_kb(),
+            )
+
+        await state.clear()
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Xatolik: {e}", reply_markup=cancel_kb())
+

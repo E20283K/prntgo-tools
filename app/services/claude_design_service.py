@@ -17,12 +17,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import fitz  # PyMuPDF
 
 from app.config import (
+    BASE_DIR,
     CLAUDE_ASSETS_DIR,
     CLAUDE_AUTH_ENV_PATH,
     CLAUDE_HOME_DIR,
     CLAUDE_MD_PATH,
     CLAUDE_MCP_CONFIG_PATH,
+    CLAUDE_OUTPUTS_DIR,
     CLAUDE_SKILLS_DIR,
+    CLAUDE_UPLOADS_DIR,
     CLAUDE_WORKSPACE_DIR,
     VECTORCRAFT_WEB_DIR,
 )
@@ -51,17 +54,40 @@ Sizning asosiy vazifangiz — foydalanuvchi so'roviga asosan `.claude/skills/` i
 ## Ishchi muhit tuzilishi
 - `.claude/skills/` — Maxsus dizayn skillari (`SKILL.md` va yordamchi fayllar/shablonlar). Vazifani bajarishdan oldin tegishli skill qoidalarini o'qing.
 - `assets/` — Serverda doimiy saqlanadigan fayllar (logotiplar, shablonlar, `.vectorcraft`, `.svg`, `.pdf`, shriftlar).
+- `uploads/` — Foydalanuvchi terminalga biriktirgan fayllar va skrinshotlar (`@uploads/...`).
+- `outputs/` — Interaktiv terminalda yaratilgan tayyor dizaynlar saqlanadigan papka (`outputs/<nomi>.vectorcraft` va `outputs/<nomi>.pdf`).
 - `.mcp.json` — `vectorcraft` MCP serveri (`vectorcraft-cli mcp --headless`).
 
 ## Majburiy Natija Qoidasi
-Har bir dizayn buyurtmasi yakunida natijani ko'rsatilgan `outputs/` papkasiga **ikkita formatda** saqlashingiz SHART:
+Har bir dizayn buyurtmasi yakunida natijani `outputs/` papkasiga **ikkita formatda** saqlashingiz SHART:
 1. **`.vectorcraft`** — VectorCraft'ning standart tahrirlanadigan fayli (`save_file` yoki `export` tool orqali `format: "vectorcraft"`).
 2. **`.pdf`** — Bosmaga tayyor vektorli PDF fayl (`export` tool orqali `format: "pdf"` yoki `vectorcraft-cli run --in <file>.vectorcraft --export <file>.pdf`).
 
 ## O'lcham va Birliklar
 - VectorCraft koordinatalari **points (pt)** da ishlaydi (`1 mm = 2.83464567 pt`, `72 pt = 25.4 mm`).
 - `run_command` orqali `addon.units.convert` (`{"value": "60mm"}`) chaqirib yoki `mm * 72 / 25.4` formulasi bilan aniq pt qiymatini hisoblang.
+
+## Skillar va Fayllarni Boshqarish Huquqi
+- Siz `.claude/skills/<skill-nomi>/SKILL.md` ichidagi barcha skillarni o'qish, tahrirlash (`Edit`/`Write`) va foydalanuvchi so'raganda yangi skilllar yaratish hamda `assets/` papkasiga qayta ishlatiladigan shablon/fayllarni saqlash bo'yicha to'liq huquqqa egasiz.
 """
+
+DEFAULT_CLAUDE_SETTINGS: Dict[str, Any] = {
+    "permissions": {
+        "allow": [
+            "Read",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "Glob",
+            "Grep",
+            "LS",
+            "Bash",
+            "mcp__vectorcraft__*",
+        ],
+        "defaultMode": "acceptEdits",
+    },
+    "enableAllProjectMcpServers": True,
+}
 
 DEFAULT_SKILL_VECTORCRAFT = """---
 name: vectorcraft-master
@@ -159,16 +185,37 @@ def ensure_claude_workspace() -> None:
     if not CLAUDE_MD_PATH.is_file():
         CLAUDE_MD_PATH.write_text(DEFAULT_CLAUDE_MD.strip() + "\n", encoding="utf-8")
 
-    # Seed default skills if no skills exist yet
-    existing_skills = [p for p in CLAUDE_SKILLS_DIR.iterdir() if p.is_dir()]
-    if not existing_skills:
-        vc_dir = CLAUDE_SKILLS_DIR / "vectorcraft-master"
+    # Seed .claude/settings.json for automatic permissions on skills, files, and VectorCraft MCP
+    for settings_dir in (CLAUDE_WORKSPACE_DIR / ".claude", CLAUDE_HOME_DIR / ".claude"):
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        settings_file = settings_dir / "settings.json"
+        if not settings_file.is_file():
+            settings_file.write_text(
+                json.dumps(DEFAULT_CLAUDE_SETTINGS, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+    # Seed built-in text skills individually if missing
+    vc_dir = CLAUDE_SKILLS_DIR / "vectorcraft-master"
+    if not (vc_dir / "SKILL.md").is_file():
         vc_dir.mkdir(parents=True, exist_ok=True)
         (vc_dir / "SKILL.md").write_text(DEFAULT_SKILL_VECTORCRAFT.strip() + "\n", encoding="utf-8")
 
-        lbl_dir = CLAUDE_SKILLS_DIR / "label-packaging-design"
+    lbl_dir = CLAUDE_SKILLS_DIR / "label-packaging-design"
+    if not (lbl_dir / "SKILL.md").is_file():
         lbl_dir.mkdir(parents=True, exist_ok=True)
         (lbl_dir / "SKILL.md").write_text(DEFAULT_SKILL_PRINT_LABEL.strip() + "\n", encoding="utf-8")
+
+    # Seed bundled directory skills from data_seed/default_skills or data/default_skills (e.g. vector-asset-sourcing)
+    for seed_root in (BASE_DIR / "data_seed" / "default_skills", BASE_DIR / "data" / "default_skills"):
+        if not seed_root.is_dir():
+            continue
+        for src_skill_dir in sorted(seed_root.iterdir()):
+            if not src_skill_dir.is_dir():
+                continue
+            dest_skill_dir = CLAUDE_SKILLS_DIR / src_skill_dir.name
+            if not (dest_skill_dir / "SKILL.md").is_file():
+                shutil.copytree(src_skill_dir, dest_skill_dir, dirs_exist_ok=True)
 
 
 # Initialize workspace on module load
@@ -681,15 +728,21 @@ def upload_skill_file(slug: str, filename: str, raw_bytes: bytes) -> Dict[str, A
         import io
 
         with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
-            names = zf.namelist()
-            has_skill_md = any(Path(n).name == "SKILL.md" for n in names)
-            if has_skill_md:
+            names = [n for n in zf.namelist() if not n.endswith("/")]
+            skill_md_entries = [n for n in names if Path(n).name == "SKILL.md"]
+            if skill_md_entries:
+                root_prefix = Path(skill_md_entries[0]).parent.as_posix()
                 for member in zf.infolist():
                     if member.is_dir():
                         continue
-                    member_name = Path(member.filename).name
-                    if member_name:
-                        (folder / member_name).write_bytes(zf.read(member))
+                    rel_posix = Path(member.filename).as_posix()
+                    if root_prefix and root_prefix != "." and rel_posix.startswith(root_prefix + "/"):
+                        rel_posix = rel_posix[len(root_prefix) + 1 :]
+                    rel_parts = [p for p in Path(rel_posix).parts if p not in ("", ".", "..")]
+                    if rel_parts:
+                        dest = folder.joinpath(*rel_parts)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(zf.read(member))
                 return get_skill(safe_slug)
 
     target = folder / safe_name
@@ -699,10 +752,13 @@ def upload_skill_file(slug: str, filename: str, raw_bytes: bytes) -> Dict[str, A
 
 def delete_skill_file(slug: str, filename: str) -> Dict[str, Any]:
     safe_slug = Path(slug).name
-    safe_name = Path(filename).name
-    target = CLAUDE_SKILLS_DIR / safe_slug / safe_name
-    if not target.is_file():
-        raise FileNotFoundError(f"Fayl topilmadi: {safe_name}")
+    folder = (CLAUDE_SKILLS_DIR / safe_slug).resolve()
+    rel_parts = [p for p in Path(filename).parts if p not in ("", ".", "..")]
+    if not rel_parts:
+        raise FileNotFoundError("Fayl nomi noto'g'ri")
+    target = folder.joinpath(*rel_parts).resolve()
+    if not str(target).startswith(str(folder)) or not target.is_file():
+        raise FileNotFoundError(f"Fayl topilmadi: {filename}")
     target.unlink()
     return get_skill(safe_slug)
 
@@ -1263,4 +1319,128 @@ def install_vectorcraft_web_bundle() -> Dict[str, Any]:
             dest.write_bytes(zf.read(member))
 
     return get_system_status()
+
+
+# ---------------------------------------------------------------------------
+# Terminal Uploads (@uploads/...) and Workspace Outputs (outputs/...)
+# ---------------------------------------------------------------------------
+def save_terminal_upload(filename: str, raw_bytes: bytes) -> Dict[str, Any]:
+    """Save an uploaded file or pasted screenshot into `/app/data/claude_workspace/uploads/`."""
+    ensure_claude_workspace()
+    CLAUDE_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    orig = Path(filename).name or f"screenshot_{int(time.time())}.png"
+    safe_stem = re.sub(r"[^a-zA-Z0-9_.-]+", "_", Path(orig).stem).strip("_") or "upload"
+    ext = Path(orig).suffix.lower() or ".png"
+    final_name = f"{safe_stem}{ext}"
+    target = CLAUDE_UPLOADS_DIR / final_name
+    if target.exists():
+        final_name = f"{safe_stem}_{int(time.time()) % 10000}{ext}"
+        target = CLAUDE_UPLOADS_DIR / final_name
+
+    target.write_bytes(raw_bytes)
+    return {
+        "filename": final_name,
+        "rel_path": f"uploads/{final_name}",
+        "mention": f"@uploads/{final_name} ",
+        "size_kb": round(len(raw_bytes) / 1024.0, 1),
+    }
+
+
+def list_terminal_uploads() -> List[Dict[str, Any]]:
+    CLAUDE_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    items: List[Dict[str, Any]] = []
+    for p in sorted(CLAUDE_UPLOADS_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+        if not p.is_file():
+            continue
+        items.append(
+            {
+                "name": p.name,
+                "ext": p.suffix.lower(),
+                "mention": f"@uploads/{p.name} ",
+                "size_kb": round(p.stat().st_size / 1024.0, 1),
+                "updated_at": p.stat().st_mtime,
+            }
+        )
+    return items[:40]
+
+
+def list_terminal_outputs(sync_dual: bool = False) -> Dict[str, Any]:
+    """List design files inside `/app/data/claude_workspace/outputs/`."""
+    CLAUDE_OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    notes: List[str] = []
+    if sync_dual:
+        notes = _ensure_dual_outputs(CLAUDE_OUTPUTS_DIR, "design")
+
+    items: List[Dict[str, Any]] = []
+    for p in sorted(CLAUDE_OUTPUTS_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+        if not p.is_file() or p.name.endswith("_preview.png"):
+            continue
+        preview_name: Optional[str] = None
+        cand = CLAUDE_OUTPUTS_DIR / f"{p.stem}_preview.png"
+        if cand.is_file():
+            preview_name = cand.name
+        items.append(
+            {
+                "filename": p.name,
+                "stem": p.stem,
+                "ext": p.suffix.lower(),
+                "size_kb": round(p.stat().st_size / 1024.0, 1),
+                "updated_at": p.stat().st_mtime,
+                "preview_file": preview_name,
+            }
+        )
+    return {"outputs": items, "notes": notes}
+
+
+def get_terminal_output_path(filename: str) -> Path:
+    safe_name = Path(filename).name
+    target = CLAUDE_OUTPUTS_DIR / safe_name
+    if not target.is_file():
+        raise FileNotFoundError(f"Output fayl topilmadi: {safe_name}")
+    return target
+
+
+def delete_terminal_output(filename: str) -> Dict[str, Any]:
+    safe_name = Path(filename).name
+    target = CLAUDE_OUTPUTS_DIR / safe_name
+    if target.is_file():
+        target.unlink()
+    prev = CLAUDE_OUTPUTS_DIR / f"{Path(safe_name).stem}_preview.png"
+    if prev.is_file():
+        prev.unlink()
+    return list_terminal_outputs(sync_dual=False)
+
+
+def promote_terminal_output_to_job(filename: str) -> Dict[str, Any]:
+    """
+    Package a file (and its sibling .vectorcraft / .pdf pair) from `claude_workspace/outputs/`
+    into a PrintHub job so it can be sent to Val Montaji, Varaq Montaji, or CorelDRAW (.cdr).
+    """
+    src = get_terminal_output_path(filename)
+    stem = src.stem
+    job_id, job_dir = create_job("vcraft_term")
+    out_dir = job_dir / "outputs"
+
+    # Copy matching stem files (.vectorcraft, .pdf, .svg)
+    for sibling in CLAUDE_OUTPUTS_DIR.glob(f"{stem}.*"):
+        if sibling.is_file():
+            shutil.copy2(sibling, out_dir / sibling.name)
+
+    notes = _ensure_dual_outputs(out_dir, stem)
+    payload = _collect_job_outputs_payload(job_id, out_dir)
+    save_job_meta(
+        job_id,
+        {
+            "job_id": job_id,
+            "tool": "vcraft_term",
+            "created_at": time.time(),
+            "outputs": [f["filename"] for f in payload["output_files"]],
+        },
+    )
+    return {
+        "job_id": job_id,
+        "conversion_notes": notes,
+        **payload,
+    }
+
 

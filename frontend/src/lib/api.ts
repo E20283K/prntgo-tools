@@ -423,4 +423,29 @@ export function aiAssetFileUrl(filename: string): string {
   return `/api/ai-design/assets/${encodeURIComponent(filename)}`
 }
 
+export interface AiTerminalUploadItem {
+  name?: string
+  filename?: string
+  ext?: string
+  rel_path?: string
+  mention: string
+  size_kb: number
+  updated_at?: number
+}
+
+export interface AiTerminalOutputItem {
+  filename: string
+  stem: string
+  ext: string
+  size_kb: number
+  updated_at: number
+  preview_file?: string | null
+}
+
+export function terminalOutputFileUrl(filename: string, inline = false): string {
+  const base = `/api/ai-design/terminal/outputs/${encodeURIComponent(filename)}`
+  return inline ? `${base}?inline=true` : base
+}
+
+
 

@@ -30,6 +30,8 @@ services:
       - ALLOWED_TELEGRAM_IDS=${ALLOWED_TELEGRAM_IDS:-}
       - PUBLIC_URL=${PUBLIC_URL:-}
       - JOB_TTL_HOURS=${JOB_TTL_HOURS:-24}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     volumes:
       - printhub_data:/app/data
     depends_on:

@@ -18,6 +18,7 @@ import {
   RefreshCw,
   Save,
   Sparkles,
+  TerminalSquare,
   Trash2,
   Upload,
   Wrench,
@@ -25,6 +26,7 @@ import {
 } from "lucide-react"
 import { toast } from "sonner"
 
+import { ClaudeTerminal } from "@/components/ClaudeTerminal"
 import { CorelExportBar, useCorelSettings } from "@/components/CorelExportBar"
 import { PdfPreview } from "@/components/PdfPreview"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -103,7 +105,7 @@ export function AiDesignTab({
   onSendToLabelImp,
   onSendToPrintImp,
 }: AiDesignTabProps) {
-  const [subTab, setSubTab] = useState<string>("studio")
+  const [subTab, setSubTab] = useState<string>("terminal")
   const [status, setStatus] = useState<AiDesignStatusResponse | null>(null)
   const [statusLoading, setStatusLoading] = useState(false)
 
@@ -550,16 +552,34 @@ export function AiDesignTab({
       </div>
 
       <Tabs value={subTab} onValueChange={setSubTab}>
-        <TabsList className="grid w-full max-w-xl grid-cols-2">
+        <TabsList className="grid w-full max-w-2xl grid-cols-3">
+          <TabsTrigger value="terminal" className="gap-1.5">
+            <TerminalSquare className="size-4" />
+            Claude Code Terminal
+          </TabsTrigger>
           <TabsTrigger value="studio" className="gap-1.5">
             <Sparkles className="size-4" />
-            AI Dizayn Generatori
+            Tezkor Forma Generator
           </TabsTrigger>
           <TabsTrigger value="settings" className="gap-1.5">
             <Wrench className="size-4" />
-            Skills, Fayllar & Claude Login
+            Skills, Fayllar & Login
           </TabsTrigger>
         </TabsList>
+
+        {/* ================================================================= */}
+        {/* SUB-TAB 0: INTERACTIVE CLAUDE CODE WEB TERMINAL (TUI)             */}
+        {/* ================================================================= */}
+        <TabsContent value="terminal" className="mt-4">
+          <ClaudeTerminal
+            active={ready && subTab === "terminal"}
+            skills={skills}
+            assets={assets}
+            onOpenInVectorCraft={onOpenInVectorCraft}
+            onSendToLabelImp={onSendToLabelImp}
+            onSendToPrintImp={onSendToPrintImp}
+          />
+        </TabsContent>
 
         {/* ================================================================= */}
         {/* SUB-TAB 1: AI DESIGN GENERATOR STUDIO                             */}

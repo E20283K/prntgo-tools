@@ -11,7 +11,19 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,6 +47,7 @@ from app.corel_converter import (
 from app.jobs import cleanup_old_jobs, get_job_output_file
 from app.services import (
     claude_design_service,
+    claude_terminal_service,
     extractor_service,
     label_imp_service,
     print_imp_service,
@@ -55,6 +68,7 @@ async def _periodic_job_cleanup() -> None:
     interval_sec = max(60, JOB_CLEANUP_INTERVAL_MINUTES * 60)
     while True:
         try:
+            claude_terminal_service.PTY_MANAGER.check_idle_cleanup()
             removed = await asyncio.to_thread(cleanup_old_jobs)
             if removed > 0:
                 logger.info("Avto-tozalash: %d ta eski job papkasi o'chirildi.", removed)
@@ -145,16 +159,81 @@ def auth_logout(response: Response) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Shared Job File Download / Preview
+# Shared Job File Download / Preview & Universal PDF-to-PNG Renderer
 # ---------------------------------------------------------------------------
+def _render_pdf_bytes_to_png_response(
+    pdf_bytes: bytes,
+    filename: str = "document.pdf",
+    page: int = 0,
+    dpi: int = 180,
+) -> Response:
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        total_pages = doc.page_count
+        if total_pages < 1:
+            raise ValueError("PDF sahifalari topilmadi.")
+        idx = max(0, min(page, total_pages - 1))
+        pix = doc[idx].get_pixmap(dpi=dpi, alpha=False)
+        png_bytes = pix.tobytes("png")
+    finally:
+        doc.close()
+
+    safe_stem = Path(filename).stem
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={
+            "Content-Disposition": f'inline; filename="{safe_stem}_p{idx + 1}.png"',
+            "X-Page-Count": str(total_pages),
+            "X-Page-Index": str(idx),
+            "Access-Control-Expose-Headers": "X-Page-Count, X-Page-Index",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/pdf/render-page", dependencies=[Depends(require_auth)])
+async def render_pdf_page_endpoint(
+    file: UploadFile = File(...),
+    page: int = Query(0, ge=0),
+    dpi: int = Query(180, ge=72, le=300),
+) -> Response:
+    try:
+        raw = await file.read()
+        return await asyncio.to_thread(
+            _render_pdf_bytes_to_png_response,
+            raw,
+            file.filename or "preview.pdf",
+            page,
+            dpi,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.get("/api/jobs/{job_id}/files/{filename}", dependencies=[Depends(require_auth)])
-def download_job_file(job_id: str, filename: str, inline: bool = Query(False)) -> FileResponse:
+def download_job_file(
+    job_id: str,
+    filename: str,
+    inline: bool = Query(False),
+    format: Optional[str] = Query(None),
+    page: int = Query(0, ge=0),
+    dpi: int = Query(180, ge=72, le=300),
+) -> Response:
     try:
         path = get_job_output_file(job_id, filename)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     ext = path.suffix.lower()
+    if format and format.lower() == "png" and ext == ".pdf":
+        try:
+            return _render_pdf_bytes_to_png_response(path.read_bytes(), path.name, page=page, dpi=dpi)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     media_map = {
         ".pdf": "application/pdf",
         ".png": "image/png",
@@ -1003,5 +1082,187 @@ async def ai_design_install_vectorcraft_web() -> Dict[str, Any]:
         return await asyncio.to_thread(claude_design_service.install_vectorcraft_web_bundle)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# 6. INTERACTIVE CLAUDE CODE WEB TERMINAL (PTY + WebSocket + Uploads/Outputs)
+# ---------------------------------------------------------------------------
+class TerminalRestartRequest(BaseModel):
+    mode: str = "claude"  # "claude" | "bash"
+    cols: int = 120
+    rows: int = 34
+
+
+@app.post("/api/ai-design/terminal/restart", dependencies=[Depends(require_auth)])
+async def ai_design_terminal_restart(body: TerminalRestartRequest) -> Dict[str, Any]:
+    await asyncio.to_thread(
+        claude_terminal_service.PTY_MANAGER.ensure_started,
+        mode=body.mode,
+        cols=body.cols,
+        rows=body.rows,
+        force_restart=True,
+    )
+    return {"ok": True, "mode": body.mode}
+
+
+@app.post("/api/ai-design/terminal/upload", dependencies=[Depends(require_auth)])
+async def ai_design_terminal_upload(file: UploadFile = File(...)) -> Dict[str, Any]:
+    try:
+        raw = await file.read()
+        return await asyncio.to_thread(
+            claude_design_service.save_terminal_upload,
+            filename=file.filename or "screenshot.png",
+            raw_bytes=raw,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/ai-design/terminal/uploads", dependencies=[Depends(require_auth)])
+def ai_design_terminal_list_uploads() -> Dict[str, Any]:
+    return {"uploads": claude_design_service.list_terminal_uploads()}
+
+
+@app.get("/api/ai-design/terminal/outputs", dependencies=[Depends(require_auth)])
+async def ai_design_terminal_list_outputs(sync: bool = Query(False)) -> Dict[str, Any]:
+    return await asyncio.to_thread(claude_design_service.list_terminal_outputs, sync_dual=sync)
+
+
+@app.get("/api/ai-design/terminal/outputs/{filename}", dependencies=[Depends(require_auth)])
+def ai_design_terminal_download_output(
+    filename: str,
+    inline: bool = Query(False),
+    format: Optional[str] = Query(None),
+    page: int = Query(0, ge=0),
+    dpi: int = Query(180, ge=72, le=300),
+) -> Response:
+    try:
+        path = claude_design_service.get_terminal_output_path(filename)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    ext = path.suffix.lower()
+    if format and format.lower() == "png" and ext == ".pdf":
+        try:
+            return _render_pdf_bytes_to_png_response(path.read_bytes(), path.name, page=page, dpi=dpi)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    media_map = {
+        ".pdf": "application/pdf",
+        ".png": "image/png",
+        ".svg": "image/svg+xml",
+        ".vectorcraft": "application/octet-stream",
+    }
+    media_type = media_map.get(ext, "application/octet-stream")
+    if inline or ext == ".png":
+        return FileResponse(
+            str(path),
+            media_type=media_type,
+            headers={"Content-Disposition": f'inline; filename="{path.name}"'},
+        )
+    return FileResponse(str(path), media_type=media_type, filename=path.name)
+
+
+@app.delete("/api/ai-design/terminal/outputs/{filename}", dependencies=[Depends(require_auth)])
+def ai_design_terminal_delete_output(filename: str) -> Dict[str, Any]:
+    return claude_design_service.delete_terminal_output(filename)
+
+
+@app.post("/api/ai-design/terminal/outputs/{filename}/to-job", dependencies=[Depends(require_auth)])
+async def ai_design_terminal_output_to_job(filename: str) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(claude_design_service.promote_terminal_output_to_job, filename)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.websocket("/api/ai-design/terminal/ws")
+async def ai_design_terminal_ws(
+    websocket: WebSocket,
+    mode: str = Query("claude"),
+    cols: int = Query(120),
+    rows: int = Query(34),
+) -> None:
+    if is_auth_enabled():
+        token = websocket.cookies.get(SESSION_COOKIE_NAME)
+        if not verify_session_token(token):
+            await websocket.close(code=4401)
+            return
+
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+    await asyncio.to_thread(
+        claude_terminal_service.PTY_MANAGER.ensure_started,
+        mode=mode,
+        cols=cols,
+        rows=rows,
+        force_restart=False,
+    )
+
+    # Send scrollback buffer immediately so the user sees the current screen
+    scrollback = claude_terminal_service.PTY_MANAGER.get_scrollback()
+    if scrollback:
+        await websocket.send_bytes(scrollback)
+
+    def _on_pty_output(chunk: bytes) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, chunk)
+
+    claude_terminal_service.PTY_MANAGER.add_listener(_on_pty_output)
+
+    async def _sender() -> None:
+        while True:
+            chunk = await queue.get()
+            await websocket.send_bytes(chunk)
+
+    sender_task = asyncio.create_task(_sender())
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if "bytes" in msg and msg["bytes"] is not None:
+                await asyncio.to_thread(
+                    claude_terminal_service.PTY_MANAGER.write_input,
+                    msg["bytes"],
+                )
+            elif "text" in msg and msg["text"] is not None:
+                txt = msg["text"]
+                if txt.startswith("{") and '"type"' in txt:
+                    try:
+                        ctrl = json.loads(txt)
+                        if ctrl.get("type") == "resize":
+                            c = int(ctrl.get("cols", 120))
+                            r = int(ctrl.get("rows", 34))
+                            await asyncio.to_thread(
+                                claude_terminal_service.PTY_MANAGER.resize, c, r
+                            )
+                            continue
+                        if ctrl.get("type") == "input":
+                            raw_in = str(ctrl.get("data", "")).encode("utf-8")
+                            await asyncio.to_thread(
+                                claude_terminal_service.PTY_MANAGER.write_input,
+                                raw_in,
+                            )
+                            continue
+                    except Exception:
+                        pass
+                await asyncio.to_thread(
+                    claude_terminal_service.PTY_MANAGER.write_input,
+                    txt.encode("utf-8"),
+                )
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.debug("Terminal WS closed: %s", exc)
+    finally:
+        claude_terminal_service.PTY_MANAGER.remove_listener(_on_pty_output)
+        sender_task.cancel()
+        try:
+            await sender_task
+        except asyncio.CancelledError:
+            pass
+
 
 
