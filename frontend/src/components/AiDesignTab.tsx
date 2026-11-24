@@ -733,27 +733,27 @@ export function AiDesignTab({
       </div>
 
       <Tabs value={subTab} onValueChange={setSubTab}>
-        <TabsList className="grid w-full max-w-2xl grid-cols-1 gap-1 group-data-horizontal/tabs:h-auto sm:grid-cols-3 sm:gap-0 sm:group-data-horizontal/tabs:h-9">
+        <TabsList className="grid w-full max-w-2xl grid-cols-1 gap-1 !h-auto md:grid-cols-3 md:gap-0 md:!h-9">
           <TabsTrigger
             value="terminal"
-            className="h-auto justify-start gap-1.5 px-2.5 py-1.5 sm:h-[calc(100%-1px)] sm:justify-center sm:px-2 sm:py-0.5"
+            className="min-w-0 w-full h-auto justify-start gap-1.5 overflow-hidden px-2.5 py-2 md:h-[calc(100%-1px)] md:justify-center md:px-2 md:py-0.5"
           >
-            <TerminalSquare className="size-4" />
-            Claude Code Terminal
+            <TerminalSquare className="size-4 shrink-0" />
+            <span className="truncate">Claude Code Terminal</span>
           </TabsTrigger>
           <TabsTrigger
             value="studio"
-            className="h-auto justify-start gap-1.5 px-2.5 py-1.5 sm:h-[calc(100%-1px)] sm:justify-center sm:px-2 sm:py-0.5"
+            className="min-w-0 w-full h-auto justify-start gap-1.5 overflow-hidden px-2.5 py-2 md:h-[calc(100%-1px)] md:justify-center md:px-2 md:py-0.5"
           >
-            <Sparkles className="size-4" />
-            Tezkor Forma Generator
+            <Sparkles className="size-4 shrink-0" />
+            <span className="truncate">Tezkor Forma Generator</span>
           </TabsTrigger>
           <TabsTrigger
             value="settings"
-            className="h-auto justify-start gap-1.5 px-2.5 py-1.5 sm:h-[calc(100%-1px)] sm:justify-center sm:px-2 sm:py-0.5"
+            className="min-w-0 w-full h-auto justify-start gap-1.5 overflow-hidden px-2.5 py-2 md:h-[calc(100%-1px)] md:justify-center md:px-2 md:py-0.5"
           >
-            <Wrench className="size-4" />
-            Skills, Fayllar & Login
+            <Wrench className="size-4 shrink-0" />
+            <span className="truncate">Skills, Fayllar & Login</span>
           </TabsTrigger>
         </TabsList>
 
