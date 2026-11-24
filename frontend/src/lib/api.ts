@@ -322,3 +322,105 @@ export function standaloneCdrConverterUrl(
   return `/api/corel/standalone-converter?${params.toString()}`
 }
 
+// ---------------------------------------------------------------------------
+// AI Design Studio (Claude Code + VectorCraft MCP + Skills & Assets)
+// ---------------------------------------------------------------------------
+export interface ClaudeLoginSessionState {
+  status: "idle" | "waiting_for_code" | "completed" | "error" | string
+  oauth_url?: string | null
+  message: string
+  output: string
+}
+
+export interface AiDesignStatusResponse {
+  claude_cli: {
+    installed: boolean
+    version: string
+  }
+  vectorcraft_cli: {
+    installed: boolean
+    version: string
+  }
+  vectorcraft_web: {
+    installed: boolean
+    url: string
+  }
+  auth: {
+    authenticated: boolean
+    auth_method: string
+    account_info: string
+    has_saved_oauth_token: boolean
+    has_saved_api_key: boolean
+    masked_oauth_token: string
+    masked_api_key: string
+    login_session: ClaudeLoginSessionState
+  }
+  workspace_dir: string
+  skills_count: number
+  assets_count: number
+}
+
+export interface AiSkillFileItem {
+  name: string
+  size_kb: number
+}
+
+export interface AiSkillSummary {
+  slug: string
+  name: string
+  description: string
+  has_skill_md: boolean
+  extra_files: AiSkillFileItem[]
+  updated_at: number
+}
+
+export interface AiSkillDetail {
+  slug: string
+  name: string
+  description: string
+  content: string
+  extra_files: AiSkillFileItem[]
+}
+
+export interface AiAssetItem {
+  name: string
+  ext: string
+  size_kb: number
+  updated_at: number
+}
+
+export interface AiDesignOutputFile {
+  filename: string
+  ext: string
+  size_kb: number
+  preview_file?: string | null
+}
+
+export interface AiDesignGenerateResponse {
+  job_id: string
+  assistant_reply: string
+  duration_sec: number
+  cost_usd?: number | null
+  num_turns?: number | null
+  conversion_notes: string[]
+  width_mm?: number | null
+  height_mm?: number | null
+  output_files: AiDesignOutputFile[]
+  vectorcraft_file?: string | null
+  pdf_file?: string | null
+  svg_file?: string | null
+  preview_file?: string | null
+  zip_file?: string | null
+}
+
+export interface VectorCraftHandoff {
+  filename: string
+  downloadUrl: string
+  sourceLabel?: string
+}
+
+export function aiAssetFileUrl(filename: string): string {
+  return `/api/ai-design/assets/${encodeURIComponent(filename)}`
+}
+
+

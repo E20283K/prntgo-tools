@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react"
 import { ThemeProvider } from "next-themes"
 
+import { AiDesignTab } from "@/components/AiDesignTab"
 import { AppSidebar, type TabKey } from "@/components/AppSidebar"
 import { ExtractorTab } from "@/components/ExtractorTab"
 import { GearsTab } from "@/components/GearsTab"
@@ -9,6 +10,7 @@ import { LoginDialog } from "@/components/LoginDialog"
 import { ModeToggle } from "@/components/ModeToggle"
 import { PrintImpTab } from "@/components/PrintImpTab"
 import { SelaTab } from "@/components/SelaTab"
+import { VectorCraftTab } from "@/components/VectorCraftTab"
 import { Separator } from "@/components/ui/separator"
 import {
   SidebarInset,
@@ -22,6 +24,7 @@ import {
   type AuthStatusResponse,
   type LabelHandoff,
   type PrintHandoff,
+  type VectorCraftHandoff,
 } from "@/lib/api"
 
 const TAB_TITLES: Record<TabKey, string> = {
@@ -29,6 +32,8 @@ const TAB_TITLES: Record<TabKey, string> = {
   extractor: "Dizayn va Pichoq Ajratish",
   "label-imp": "Val Montaji",
   "print-imp": "Varaq Montaji",
+  "ai-design": "AI Dizayn & Skills (Claude Code + VectorCraft MCP)",
+  vectorcraft: "VectorCraft Web Muharriri",
   gears: "Vallar (Gears)",
 }
 
@@ -39,6 +44,8 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false)
   const [labelHandoff, setLabelHandoff] = useState<LabelHandoff | null>(null)
   const [printHandoff, setPrintHandoff] = useState<PrintHandoff | null>(null)
+  const [vectorCraftHandoff, setVectorCraftHandoff] =
+    useState<VectorCraftHandoff | null>(null)
 
   const checkAuth = useCallback(async () => {
     try {
@@ -73,6 +80,11 @@ export default function App() {
     setActiveTab("print-imp")
   }
 
+  function handleOpenInVectorCraft(handoff: VectorCraftHandoff) {
+    setVectorCraftHandoff(handoff)
+    setActiveTab("vectorcraft")
+  }
+
   const appReady = authChecked && authenticated
 
   return (
@@ -100,7 +112,10 @@ export default function App() {
 
             <main
               className={`mx-auto w-full flex-1 p-4 md:p-6 ${
-                activeTab === "label-imp" || activeTab === "extractor"
+                activeTab === "label-imp" ||
+                activeTab === "extractor" ||
+                activeTab === "ai-design" ||
+                activeTab === "vectorcraft"
                   ? "max-w-[1800px]"
                   : "max-w-6xl"
               }`}
@@ -131,6 +146,26 @@ export default function App() {
                   ready={appReady}
                   handoff={printHandoff}
                   onClearHandoff={() => setPrintHandoff(null)}
+                />
+              </div>
+
+              <div className={activeTab === "ai-design" ? "block" : "hidden"}>
+                <AiDesignTab
+                  ready={appReady}
+                  onOpenInVectorCraft={handleOpenInVectorCraft}
+                  onSendToLabelImp={handleSendToLabelImp}
+                  onSendToPrintImp={handleSendToPrintImp}
+                />
+              </div>
+
+              <div className={activeTab === "vectorcraft" ? "block" : "hidden"}>
+                <VectorCraftTab
+                  ready={appReady}
+                  active={appReady && activeTab === "vectorcraft"}
+                  handoff={vectorCraftHandoff}
+                  onClearHandoff={() => setVectorCraftHandoff(null)}
+                  onSendToLabelImp={handleSendToLabelImp}
+                  onSendToPrintImp={handleSendToPrintImp}
                 />
               </div>
 

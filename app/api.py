@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import logging
+import mimetypes
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,7 +25,7 @@ from app.auth import (
     verify_password,
     verify_session_token,
 )
-from app.config import JOB_CLEANUP_INTERVAL_MINUTES, SESSION_COOKIE_NAME
+from app.config import JOB_CLEANUP_INTERVAL_MINUTES, SESSION_COOKIE_NAME, VECTORCRAFT_WEB_DIR
 from app.corel_converter import (
     COREL_VERSIONS,
     DEFAULT_COREL_VERSION,
@@ -32,10 +33,22 @@ from app.corel_converter import (
     build_standalone_converter_zip,
 )
 from app.jobs import cleanup_old_jobs, get_job_output_file
-from app.services import extractor_service, label_imp_service, print_imp_service, sela_service
+from app.services import (
+    claude_design_service,
+    extractor_service,
+    label_imp_service,
+    print_imp_service,
+    sela_service,
+)
+
+# Ensure WebAssembly & Font MIME types are registered for VectorCraft Web
+mimetypes.add_type("application/wasm", ".wasm")
+mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("font/ttf", ".ttf")
 
 logger = logging.getLogger("printhub.api")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+VECTORCRAFT_WEB_DIR.mkdir(parents=True, exist_ok=True)
 
 
 async def _periodic_job_cleanup() -> None:
@@ -81,6 +94,9 @@ app.add_middleware(
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+if VECTORCRAFT_WEB_DIR.is_dir():
+    app.mount("/vectorcraft", StaticFiles(directory=str(VECTORCRAFT_WEB_DIR), html=True), name="vectorcraft")
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +161,7 @@ def download_job_file(job_id: str, filename: str, inline: bool = Query(False)) -
         ".svg": "image/svg+xml",
         ".eps": "application/postscript",
         ".zip": "application/zip",
+        ".vectorcraft": "application/octet-stream",
     }
     media_type = media_map.get(ext, "application/octet-stream")
     if inline or ext == ".png":
@@ -741,4 +758,250 @@ async def extractor_run(body: ExtractorRunRequest) -> Dict[str, Any]:
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# 5. AI DESIGN STUDIO (CLAUDE CODE + VECTORCRAFT MCP + SKILLS & ASSETS)
+# ---------------------------------------------------------------------------
+class ClaudeAuthTokenRequest(BaseModel):
+    oauth_token: Optional[str] = None
+    api_key: Optional[str] = None
+
+
+class ClaudeLoginCodeRequest(BaseModel):
+    code: str
+
+
+class SkillSaveRequest(BaseModel):
+    slug: Optional[str] = None
+    name: str
+    description: str = ""
+    content: str
+
+
+class WorkspaceConfigSaveRequest(BaseModel):
+    mcp_json: Optional[str] = None
+    claude_md: Optional[str] = None
+
+
+@app.get("/api/ai-design/status", dependencies=[Depends(require_auth)])
+async def ai_design_status() -> Dict[str, Any]:
+    return await asyncio.to_thread(claude_design_service.get_system_status)
+
+
+@app.post("/api/ai-design/auth/token", dependencies=[Depends(require_auth)])
+async def ai_design_save_token(body: ClaudeAuthTokenRequest) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(
+            claude_design_service.save_auth_env,
+            oauth_token=body.oauth_token,
+            api_key=body.api_key,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/ai-design/auth/login/start", dependencies=[Depends(require_auth)])
+async def ai_design_start_login() -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(claude_design_service.start_claude_login)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/ai-design/auth/login/code", dependencies=[Depends(require_auth)])
+async def ai_design_submit_login_code(body: ClaudeLoginCodeRequest) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(claude_design_service.submit_claude_login_code, body.code)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/ai-design/auth/login/state", dependencies=[Depends(require_auth)])
+def ai_design_login_state() -> Dict[str, Any]:
+    return claude_design_service.get_login_session_state()
+
+
+@app.get("/api/ai-design/skills", dependencies=[Depends(require_auth)])
+def ai_design_list_skills() -> Dict[str, Any]:
+    return {"skills": claude_design_service.list_skills()}
+
+
+@app.get("/api/ai-design/skills/{slug}", dependencies=[Depends(require_auth)])
+def ai_design_get_skill(slug: str) -> Dict[str, Any]:
+    try:
+        return claude_design_service.get_skill(slug)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/ai-design/skills", dependencies=[Depends(require_auth)])
+def ai_design_save_skill(body: SkillSaveRequest) -> Dict[str, Any]:
+    try:
+        return claude_design_service.save_skill(
+            name=body.name,
+            description=body.description,
+            content=body.content,
+            slug=body.slug,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/ai-design/skills/{slug}", dependencies=[Depends(require_auth)])
+def ai_design_delete_skill(slug: str) -> Dict[str, Any]:
+    try:
+        return claude_design_service.delete_skill(slug)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/ai-design/skills/{slug}/files", dependencies=[Depends(require_auth)])
+async def ai_design_upload_skill_file(slug: str, file: UploadFile = File(...)) -> Dict[str, Any]:
+    try:
+        raw = await file.read()
+        return await asyncio.to_thread(
+            claude_design_service.upload_skill_file,
+            slug=slug,
+            filename=file.filename or "resource.bin",
+            raw_bytes=raw,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/ai-design/skills/{slug}/files/{filename}", dependencies=[Depends(require_auth)])
+def ai_design_delete_skill_file(slug: str, filename: str) -> Dict[str, Any]:
+    try:
+        return claude_design_service.delete_skill_file(slug, filename)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/ai-design/assets", dependencies=[Depends(require_auth)])
+def ai_design_list_assets() -> Dict[str, Any]:
+    return {"assets": claude_design_service.list_assets()}
+
+
+@app.post("/api/ai-design/assets", dependencies=[Depends(require_auth)])
+async def ai_design_upload_assets(files: List[UploadFile] = File(...)) -> Dict[str, Any]:
+    try:
+        uploaded = []
+        for f in files:
+            if f.filename:
+                raw = await f.read()
+                item = await asyncio.to_thread(claude_design_service.save_asset, f.filename, raw)
+                uploaded.append(item)
+        return {"uploaded": uploaded, "assets": claude_design_service.list_assets()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/ai-design/assets/{filename}", dependencies=[Depends(require_auth)])
+def ai_design_download_asset(filename: str) -> FileResponse:
+    try:
+        path = claude_design_service.get_asset_path(filename)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return FileResponse(str(path), filename=path.name)
+
+
+@app.delete("/api/ai-design/assets/{filename}", dependencies=[Depends(require_auth)])
+def ai_design_delete_asset(filename: str) -> Dict[str, Any]:
+    try:
+        return claude_design_service.delete_asset(filename)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/ai-design/workspace-config", dependencies=[Depends(require_auth)])
+def ai_design_get_workspace_config() -> Dict[str, Any]:
+    return claude_design_service.get_workspace_config()
+
+
+@app.post("/api/ai-design/workspace-config", dependencies=[Depends(require_auth)])
+def ai_design_save_workspace_config(body: WorkspaceConfigSaveRequest) -> Dict[str, Any]:
+    try:
+        return claude_design_service.save_workspace_config(
+            mcp_json=body.mcp_json,
+            claude_md=body.claude_md,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/ai-design/generate", dependencies=[Depends(require_auth)])
+async def ai_design_generate(
+    prompt: str = Form(...),
+    skill_slugs_json: Optional[str] = Form(None),
+    asset_names_json: Optional[str] = Form(None),
+    width_mm: Optional[str] = Form(None),
+    height_mm: Optional[str] = Form(None),
+    output_basename: str = Form("design"),
+    source_job_id: Optional[str] = Form(None),
+    source_filename: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None),
+) -> Dict[str, Any]:
+    try:
+        skill_slugs = json.loads(skill_slugs_json) if skill_slugs_json else []
+        asset_names = json.loads(asset_names_json) if asset_names_json else []
+        w_mm = float(width_mm) if (width_mm and width_mm.strip()) else None
+        h_mm = float(height_mm) if (height_mm and height_mm.strip()) else None
+
+        uploaded_files: List[tuple[str, bytes]] = []
+        for f in (files or []):
+            if f.filename:
+                uploaded_files.append((f.filename, await f.read()))
+
+        return await asyncio.to_thread(
+            claude_design_service.run_ai_design_job,
+            prompt=prompt,
+            skill_slugs=skill_slugs,
+            asset_names=asset_names,
+            width_mm=w_mm,
+            height_mm=h_mm,
+            output_basename=output_basename,
+            uploaded_files=uploaded_files,
+            source_job_id=source_job_id,
+            source_filename=source_filename,
+            model=model,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/ai-design/editor-export", dependencies=[Depends(require_auth)])
+async def ai_design_editor_export(
+    file: UploadFile = File(...),
+    save_to_assets: bool = Form(False),
+) -> Dict[str, Any]:
+    try:
+        raw = await file.read()
+        return await asyncio.to_thread(
+            claude_design_service.export_vectorcraft_document,
+            filename=file.filename or "design.vectorcraft",
+            raw_bytes=raw,
+            save_to_assets=save_to_assets,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/ai-design/jobs/{job_id}/save-asset", dependencies=[Depends(require_auth)])
+async def ai_design_save_job_asset(job_id: str, filename: str = Form(...)) -> Dict[str, Any]:
+    try:
+        item = await asyncio.to_thread(claude_design_service.save_job_file_to_assets, job_id, filename)
+        return {"saved": item, "assets": claude_design_service.list_assets()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/ai-design/install-vectorcraft-web", dependencies=[Depends(require_auth)])
+async def ai_design_install_vectorcraft_web() -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(claude_design_service.install_vectorcraft_web_bundle)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 

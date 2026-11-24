@@ -17,8 +17,31 @@ SELA_SET_DIR = DATA_DIR / "sela_set"
 FONTS_DIR = DATA_DIR / "fonts"
 JOBS_DIR = DATA_DIR / "jobs"
 
+# Claude Code & VectorCraft persistent directories
+CLAUDE_HOME_DIR = DATA_DIR / "claude_home"
+CLAUDE_WORKSPACE_DIR = DATA_DIR / "claude_workspace"
+CLAUDE_SKILLS_DIR = CLAUDE_WORKSPACE_DIR / ".claude" / "skills"
+CLAUDE_ASSETS_DIR = CLAUDE_WORKSPACE_DIR / "assets"
+CLAUDE_MCP_CONFIG_PATH = CLAUDE_WORKSPACE_DIR / ".mcp.json"
+CLAUDE_MD_PATH = CLAUDE_WORKSPACE_DIR / "CLAUDE.md"
+CLAUDE_AUTH_ENV_PATH = CLAUDE_HOME_DIR / "auth_env.json"
+
+VECTORCRAFT_WEB_DIR = Path(
+    os.environ.get("VECTORCRAFT_WEB_DIR", str(DATA_DIR / "vectorcraft_web"))
+).resolve()
+
 # Ensure required directories exist
-for _d in (DATA_DIR, SELA_TEMPLATES_DIR, SELA_SET_DIR, FONTS_DIR, JOBS_DIR):
+for _d in (
+    DATA_DIR,
+    SELA_TEMPLATES_DIR,
+    SELA_SET_DIR,
+    FONTS_DIR,
+    JOBS_DIR,
+    CLAUDE_HOME_DIR,
+    CLAUDE_WORKSPACE_DIR,
+    CLAUDE_SKILLS_DIR,
+    CLAUDE_ASSETS_DIR,
+):
     _d.mkdir(parents=True, exist_ok=True)
 
 # Security & Access Control

@@ -24,9 +24,20 @@ Ushbu loyiha **Web sayt (FastAPI)** va **Telegram Bot (aiogram 3)** ni bitta Doc
 2. **Sela Etiketka** bo'limida `⬆️ Yangi shablon yuklash` tugmasi orqali Sela `.pdf` yoki `.svg` shabloningizni bir marta yuklab qo'ying — u doimiy volume da saqlanadi va Web hamda Telegram Bot uchun ishlaydi.
 3. **Vallar (Gears)** bo'limida o'zingizdagi mavjud vallarni tekshirib qo'ying.
 
-## 4. Lokal kompyuterda sinash
+## 4. Claude Code + VectorCraft MCP va Web Muharriri
+Docker konteyner ([Dockerfile](Dockerfile)) ichiga avtomatik ravishda quyidagilar o'rnatiladi:
+- **Claude Code CLI (`@anthropic-ai/claude-code`)** — sizning Claude Pro/Max obunangiz bilan ishlaydi.
+- **`vectorcraft-cli` (v0.24.1)** — Headless VectorCraft MCP serveri (`vectorcraft-cli mcp --headless`) va `.vectorcraft` ↔ `.pdf` konverteri.
+- **`vectorcraft-web` (v0.24.1 WASM)** — Brauzer ichida (`/vectorcraft/` va **VectorCraft Web** menyusida) to'liq ishlovchi grafik muharrir.
+
+### Claude Obunasini Ulash (2 xil usul):
+1. **Web-dastur ichidan:** **AI Dizayn & Skills → Skills, Fayllar & Claude Login** bo'limiga kiring:
+   - **A-usul:** **"Claude Login Havolasini Olish"** tugmasini bosib, chiqqan OAuth havola orqali akkauntingizga kiring va tasdiqlash kodini kiriting.
+   - **B-usul:** Kompyuteringizda `claude setup-token` orqali olingan tokenni (`CLAUDE_CODE_OAUTH_TOKEN`) formaga (yoki Coolify Environment Variables ga) kiriting.
+2. Login ma'lumotlari `/app/data/claude_home` ichida, maxsus Skillar `/app/data/claude_workspace/.claude/skills/` ichida va doimiy dizayn fayllari `/app/data/claude_workspace/assets/` ichida saqlanadi (redeploy qilinganda o'chib ketmaydi).
+
+## 5. Lokal kompyuterda sinash
 ```bash
-cd print_hub
 pip install -r requirements.txt
 uvicorn app.api:app --reload --port 8000
 ```

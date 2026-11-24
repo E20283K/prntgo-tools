@@ -12,3 +12,6 @@ frontend/dist/
 
 data/jobs/*
 !data/jobs/.gitkeep
+data/claude_home/
+data/claude_workspace/
+data/vectorcraft_web/

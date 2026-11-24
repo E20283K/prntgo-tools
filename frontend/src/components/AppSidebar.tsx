@@ -3,7 +3,9 @@ import {
   Cylinder,
   LayoutGrid,
   LogOut,
+  PenTool,
   Scissors,
+  Sparkles,
   Tag,
 } from "lucide-react"
 
@@ -24,7 +26,14 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar"
 
-export type TabKey = "sela" | "extractor" | "label-imp" | "print-imp" | "gears"
+export type TabKey =
+  | "sela"
+  | "extractor"
+  | "label-imp"
+  | "print-imp"
+  | "ai-design"
+  | "vectorcraft"
+  | "gears"
 
 interface AppSidebarProps {
   activeTab: TabKey
@@ -104,6 +113,35 @@ export function AppSidebar({
                 >
                   <LayoutGrid />
                   <span>Varaq Montaji</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+
+        <SidebarGroup>
+          <SidebarGroupLabel>AI va VectorCraft</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  isActive={activeTab === "ai-design"}
+                  tooltip="AI Dizayn & Skills (Claude)"
+                  onClick={() => onSelectTab("ai-design")}
+                >
+                  <Sparkles />
+                  <span>AI Dizayn & Skills</span>
+                </SidebarMenuButton>
+                <SidebarMenuBadge>AI</SidebarMenuBadge>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  isActive={activeTab === "vectorcraft"}
+                  tooltip="VectorCraft Web Editor"
+                  onClick={() => onSelectTab("vectorcraft")}
+                >
+                  <PenTool />
+                  <span>VectorCraft Web</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
             </SidebarMenu>
