@@ -131,20 +131,64 @@ def cdr_result_kb(job_id: str) -> InlineKeyboardMarkup:
 
 
 # ---------------------------------------------------------------------------
-# Start & Home
+# Start, Home & Slash Commands (registered BEFORE FSM state handlers so
+# typing any /command immediately switches tools from any state)
 # ---------------------------------------------------------------------------
+async def _reply_or_edit(
+    event: Message | CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(text, reply_markup=reply_markup)
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=reply_markup)
+
+
 @router.message(CommandStart())
 @router.message(Command("menu"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "👋 <b>PrintHub Poligrafiya Botiga xush kelibsiz!</b>\n\n"
-        "Kerakli bo'limni tanlang:\n"
-        "• <b>Sela Etiketka</b> — barkodli etiketka yaratish (so'ngra 1 tugma bilan Valga joylashtirish)\n"
-        "• <b>Stiker Val Montaji</b> — istalgan PDF stikerni avtomatik valga terish\n"
-        "• <b>Varaq Montaji</b> — ofset/raqamli varaq montaji va preflight",
+        "Kerakli bo'limni tanlang yoki <code>/</code> buyrug'ini yuboring:\n"
+        "• /sela — <b>Sela Etiketka</b> (barkodli etiketka yaratish)\n"
+        "• /val — <b>Stiker Val Montaji</b> (PDF stikerni avtomatik valga terish)\n"
+        "• /varaq — <b>Varaq Montaji</b> (ofset/raqamli varaq montaji va preflight)\n"
+        "• /ai — <b>AI Dizayn</b> (Claude + VectorCraft)\n"
+        "• /cancel — joriy amalni bekor qilish",
         reply_markup=main_menu_kb(),
     )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "❌ Joriy amal bekor qilindi. Kerakli bo'limni tanlang:",
+        reply_markup=main_menu_kb(),
+    )
+
+
+@router.message(Command("sela"))
+async def cmd_sela(message: Message, state: FSMContext) -> None:
+    await _start_sela(message, state)
+
+
+@router.message(Command("val", "label"))
+async def cmd_label_imp(message: Message, state: FSMContext) -> None:
+    await _start_label_imp(message, state)
+
+
+@router.message(Command("varaq", "print"))
+async def cmd_print_imp(message: Message, state: FSMContext) -> None:
+    await _start_print_imp(message, state)
+
+
+@router.message(Command("ai"))
+async def cmd_ai_design(message: Message, state: FSMContext) -> None:
+    await _start_ai_design(message, state)
 
 
 @router.callback_query(F.data == "menu:home")
@@ -160,17 +204,16 @@ async def cb_home(call: CallbackQuery, state: FSMContext) -> None:
 # ---------------------------------------------------------------------------
 # 1. SELA GENERATOR FLOW
 # ---------------------------------------------------------------------------
-@router.callback_query(F.data == "menu:sela")
-async def cb_sela_start(call: CallbackQuery, state: FSMContext) -> None:
+async def _start_sela(event: Message | CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     templates = sela_service.list_templates()
     if not templates:
-        await call.message.edit_text(
+        await _reply_or_edit(
+            event,
             "⚠️ Serverda hali Sela shabloni (.pdf/.svg) yuklanmagan.\n"
             "Iltimos, avval Web sayt orqali Sela shablonini bir marta yuklab qo'ying.",
             reply_markup=cancel_kb(),
         )
-        await call.answer()
         return
 
     kb = InlineKeyboardMarkup(
@@ -181,13 +224,18 @@ async def cb_sela_start(call: CallbackQuery, state: FSMContext) -> None:
         ]
     )
     await state.set_state(SelaStates.waiting_mode)
-    await call.message.edit_text(
+    await _reply_or_edit(
+        event,
         f"🏷️ <b>Sela Etiketka Generatori</b>\n"
         f"Faol shablon: <code>{templates[0]['name']}</code>\n\n"
         f"Ma'lumotni qanday kiritasiz?",
         reply_markup=kb,
     )
-    await call.answer()
+
+
+@router.callback_query(F.data == "menu:sela")
+async def cb_sela_start(call: CallbackQuery, state: FSMContext) -> None:
+    await _start_sela(call, state)
 
 
 @router.callback_query(F.data == "sela:manual")
@@ -368,16 +416,20 @@ async def cb_handoff_to_label_imp(call: CallbackQuery, state: FSMContext) -> Non
 # ---------------------------------------------------------------------------
 # 2. LABEL IMPOSITION FLOW
 # ---------------------------------------------------------------------------
-@router.callback_query(F.data == "menu:label_imp")
-async def cb_label_imp_start(call: CallbackQuery, state: FSMContext) -> None:
+async def _start_label_imp(event: Message | CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(LabelImpStates.waiting_pdf)
-    await call.message.edit_text(
+    await _reply_or_edit(
+        event,
         "⚙️ <b>Stiker Val Montaji (Flexo / Gear)</b>\n\n"
         "📎 Istalgan stiker PDF faylini yuboring (bitta stiker, ko'p betli PDF yoki Sela A4 varag'i).",
         reply_markup=cancel_kb(),
     )
-    await call.answer()
+
+
+@router.callback_query(F.data == "menu:label_imp")
+async def cb_label_imp_start(call: CallbackQuery, state: FSMContext) -> None:
+    await _start_label_imp(call, state)
 
 
 @router.message(LabelImpStates.waiting_pdf, F.document)
@@ -511,16 +563,20 @@ async def limp_got_custom_gear(message: Message, state: FSMContext) -> None:
 # ---------------------------------------------------------------------------
 # 3. PRINT IMPOSITION (SHEET) FLOW
 # ---------------------------------------------------------------------------
-@router.callback_query(F.data == "menu:print_imp")
-async def cb_print_imp_start(call: CallbackQuery, state: FSMContext) -> None:
+async def _start_print_imp(event: Message | CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(PrintImpStates.waiting_front_pdf)
-    await call.message.edit_text(
+    await _reply_or_edit(
+        event,
         "📄 <b>Varaq Montaji (Ofset / Raqamli)</b>\n\n"
         "📎 Dizayn PDF faylini yuboring (avtomatik Preflight + o'lcham aniqlanadi).",
         reply_markup=cancel_kb(),
     )
-    await call.answer()
+
+
+@router.callback_query(F.data == "menu:print_imp")
+async def cb_print_imp_start(call: CallbackQuery, state: FSMContext) -> None:
+    await _start_print_imp(call, state)
 
 
 @router.message(PrintImpStates.waiting_front_pdf, F.document)
@@ -672,9 +728,7 @@ async def print_got_qty(message: Message, state: FSMContext) -> None:
 # ---------------------------------------------------------------------------
 # 4. AI DESIGN (CLAUDE CODE + VECTORCRAFT MCP) FLOW
 # ---------------------------------------------------------------------------
-@router.callback_query(F.data == "menu:ai_design")
-@router.message(Command("ai"))
-async def cb_ai_design_start(event: Message | CallbackQuery, state: FSMContext) -> None:
+async def _start_ai_design(event: Message | CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     skills = claude_design_service.list_skills()
     assets = claude_design_service.list_assets()
@@ -699,11 +753,12 @@ async def cb_ai_design_start(event: Message | CallbackQuery, state: FSMContext) 
         f"1/2 — Dizayn o'lchamini tanlang (yoki <code>60x40</code> shaklida yozib yuboring):"
     )
     await state.set_state(AiDesignStates.waiting_size)
-    if isinstance(event, CallbackQuery):
-        await event.message.edit_text(text, reply_markup=kb)
-        await event.answer()
-    else:
-        await event.answer(text, reply_markup=kb)
+    await _reply_or_edit(event, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "menu:ai_design")
+async def cb_ai_design_start(call: CallbackQuery, state: FSMContext) -> None:
+    await _start_ai_design(call, state)
 
 
 @router.callback_query(AiDesignStates.waiting_size, F.data.startswith("ai_size:"))
