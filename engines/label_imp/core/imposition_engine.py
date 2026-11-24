@@ -257,6 +257,23 @@ def build_imposed_pdf_from_columns(
     return out_doc, audit_report
 
 
+def _ensure_corel_compatible_pdf(doc: pymupdf.Document) -> None:
+    """
+    Ensures every /FontDescriptor in `doc` contains `/CapHeight` (required by CorelDRAW's
+    PDF import filter; missing `/CapHeight` causes CorelDRAW `OpenDocument` to fail with
+    'Object required').
+    """
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref)
+            if "/Type /FontDescriptor" in obj and "/CapHeight" not in obj:
+                ascent_type, ascent_val = doc.xref_get_key(xref, "Ascent")
+                cap_h = ascent_val if (ascent_type in ("int", "float") and ascent_val) else "700"
+                doc.xref_set_key(xref, "CapHeight", str(cap_h))
+        except Exception:
+            continue
+
+
 def save_output_formats(
     doc: pymupdf.Document,
     pdf_output_path: Path,
@@ -265,6 +282,7 @@ def save_output_formats(
 ) -> List[Path]:
     """Saves the imposed vector PDF and optionally exports vector SVG and EPS files."""
     pdf_output_path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_corel_compatible_pdf(doc)
     doc.save(pdf_output_path, garbage=4, deflate=True)
     saved: List[Path] = [pdf_output_path]
 

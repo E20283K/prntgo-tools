@@ -262,6 +262,24 @@ def prepare_clean_template(template_path: Path) -> Tuple[bytes, pymupdf.Rect]:
     return clean_bytes, label_rect
 
 
+def _ensure_corel_compatible_font_descriptors(doc: pymupdf.Document) -> None:
+    """
+    CorelDRAW's PDF import filter crashes with 'Failed to open document / Object required'
+    if any /FontDescriptor dictionary lacks the /CapHeight key (PyMuPDF's insert_font +
+    subset_fonts omits /CapHeight by default). This helper injects /CapHeight into every
+    /FontDescriptor in the document.
+    """
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref)
+            if "/Type /FontDescriptor" in obj and "/CapHeight" not in obj:
+                ascent_type, ascent_val = doc.xref_get_key(xref, "Ascent")
+                cap_h = ascent_val if (ascent_type in ("int", "float") and ascent_val) else "700"
+                doc.xref_set_key(xref, "CapHeight", str(cap_h))
+        except Exception:
+            continue
+
+
 def render_label_preview_pdf(
     template_path: Path,
     data: LabelData,
@@ -293,6 +311,7 @@ def render_label_preview_pdf(
             ocrb_fontname="F_OCRB",
         )
         prev_doc.subset_fonts()
+        _ensure_corel_compatible_font_descriptors(prev_doc)
         return prev_doc.tobytes(garbage=4, deflate=True)
     finally:
         clean_doc.close()
@@ -674,6 +693,7 @@ def generate_a4_pdf(
                     emit_statics()
 
         out_doc.subset_fonts()
+        _ensure_corel_compatible_font_descriptors(out_doc)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         out_doc.save(str(output_path), garbage=4, deflate=True)
         page_count = len(out_doc)

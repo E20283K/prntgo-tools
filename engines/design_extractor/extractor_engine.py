@@ -1247,6 +1247,16 @@ def extract_region_to_pdf_doc(
         if rotation_deg in (90, 180, 270):
             page.set_rotation(rotation_deg)
 
+        for xref in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xref)
+                if "/Type /FontDescriptor" in obj and "/CapHeight" not in obj:
+                    ascent_type, ascent_val = doc.xref_get_key(xref, "Ascent")
+                    cap_h = ascent_val if (ascent_type in ("int", "float") and ascent_val) else "700"
+                    doc.xref_set_key(xref, "CapHeight", str(cap_h))
+            except Exception:
+                continue
+
         compact_bytes = doc.tobytes(garbage=3, deflate=True)
         doc.close()
         clean_doc = pymupdf.open("pdf", compact_bytes)

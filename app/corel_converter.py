@@ -14,7 +14,34 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import pymupdf
+
 from app.jobs import get_job_dir, get_job_output_file
+
+
+def sanitize_pdf_bytes_for_corel(pdf_bytes: bytes) -> bytes:
+    """
+    Ensures a PDF file's /FontDescriptor dictionaries all include /CapHeight so that
+    CorelDRAW's PDF import filter never fails with 'Failed to open document / Object required'.
+    """
+    try:
+        doc = pymupdf.open("pdf", pdf_bytes)
+        modified = False
+        try:
+            for xref in range(1, doc.xref_length()):
+                obj = doc.xref_object(xref)
+                if "/Type /FontDescriptor" in obj and "/CapHeight" not in obj:
+                    ascent_type, ascent_val = doc.xref_get_key(xref, "Ascent")
+                    cap_h = ascent_val if (ascent_type in ("int", "float") and ascent_val) else "700"
+                    doc.xref_set_key(xref, "CapHeight", str(cap_h))
+                    modified = True
+            if modified:
+                return doc.tobytes(garbage=3, deflate=True)
+        finally:
+            doc.close()
+    except Exception:
+        pass
+    return pdf_bytes
 
 DEFAULT_COREL_VERSION = 18
 
@@ -355,7 +382,8 @@ def build_cdr_bundle_zip(
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for p in pdf_files:
-            zf.write(p, arcname=p.name)
+            clean_pdf = sanitize_pdf_bytes_for_corel(p.read_bytes())
+            zf.writestr(p.name, clean_pdf)
         # UTF-8 without BOM works for .bat, while Windows VBScript handles ASCII/ANSI cleanly
         zf.writestr(vbs_name, vbs_content.encode("utf-8"))
         zf.writestr(bat_name, bat_content.encode("utf-8"))
