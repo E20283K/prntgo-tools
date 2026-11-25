@@ -65,6 +65,7 @@ import {
   type LabelInspectDesign,
   type LabelInspectResponse,
   type LabelRunResponse,
+  type LabelRunStatusResponse,
 } from "@/lib/api"
 
 interface LabelImpTabProps {
@@ -116,12 +117,20 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
   const [previewError, setPreviewError] = useState<string | null>(null)
 
   const [running, setRunning] = useState(false)
+  const [runProgress, setRunProgress] = useState<{
+    current: number
+    total: number
+    percent: number
+    message: string
+    elapsedSec: number
+  } | null>(null)
   const [result, setResult] = useState<LabelRunResponse | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const resultCardRef = useRef<HTMLDivElement>(null)
   const previewUrlRef = useRef<string | null>(null)
   const previewAbortRef = useRef<AbortController | null>(null)
+  const runSeqRef = useRef(0)
 
   const hasSource = Boolean(handoff || files.length > 0)
 
@@ -281,6 +290,7 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
 
   useEffect(() => {
     return () => {
+      runSeqRef.current += 1
       previewAbortRef.current?.abort()
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current)
     }
@@ -303,7 +313,15 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
   }
 
   async function handleRun() {
+    const seq = ++runSeqRef.current
     setRunning(true)
+    setRunProgress({
+      current: 0,
+      total: 1,
+      percent: 0,
+      message: "Fayllar serverga yuborilmoqda...",
+      elapsedSec: 0,
+    })
     try {
       const fd = new FormData()
       if (handoff) {
@@ -330,20 +348,61 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
       fd.append("export_svg", String(exportSvg))
       fd.append("export_eps", String(exportEps))
 
-      const res = await apiFetch("/api/label-imp/run", {
+      const startRes = await apiFetch("/api/label-imp/run/start", {
         method: "POST",
         body: fd,
       })
-      const data: LabelRunResponse = await res.json()
-      setResult(data)
-      toast.success("Val montaji muvaffaqiyatli yakunlandi")
-      window.setTimeout(() => {
-        resultCardRef.current?.scrollIntoView({ behavior: "smooth" })
-      }, 100)
+      const { run_id } = (await startRes.json()) as { run_id: string }
+
+      let pollErrors = 0
+      while (runSeqRef.current === seq) {
+        await new Promise((r) => window.setTimeout(r, 350))
+        if (runSeqRef.current !== seq) return
+
+        let statusData: LabelRunStatusResponse
+        try {
+          const pollRes = await apiFetch(
+            `/api/label-imp/runs/${encodeURIComponent(run_id)}`
+          )
+          statusData = (await pollRes.json()) as LabelRunStatusResponse
+          pollErrors = 0
+        } catch (pollErr) {
+          pollErrors += 1
+          if (pollErrors >= 5) throw pollErr
+          continue
+        }
+
+        if (runSeqRef.current !== seq) return
+
+        setRunProgress({
+          current: statusData.current,
+          total: statusData.total,
+          percent: statusData.percent,
+          message: statusData.message,
+          elapsedSec: statusData.elapsed_sec,
+        })
+
+        if (statusData.status === "done" && statusData.result) {
+          setResult(statusData.result)
+          toast.success("Val montaji muvaffaqiyatli yakunlandi")
+          window.setTimeout(() => {
+            resultCardRef.current?.scrollIntoView({ behavior: "smooth" })
+          }, 100)
+          return
+        }
+        if (statusData.status === "error") {
+          throw new Error(statusData.error || statusData.message || "Montaj xatosi")
+        }
+      }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Montaj xatosi")
+      if (runSeqRef.current === seq) {
+        toast.error(err instanceof Error ? err.message : "Montaj xatosi")
+      }
     } finally {
-      setRunning(false)
+      if (runSeqRef.current === seq) {
+        setRunning(false)
+        setRunProgress(null)
+      }
     }
   }
 
@@ -807,9 +866,35 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
             >
               {running ? <Loader2 className="animate-spin" /> : <Play />}
               <span>
-                {running ? "Montaj bajarilmoqda..." : "Valga Joylashtirish"}
+                {running
+                  ? `Montaj bajarilmoqda...${runProgress ? ` ${runProgress.percent}%` : ""}`
+                  : "Valga Joylashtirish"}
               </span>
             </Button>
+
+            {running && runProgress && (
+              <div className="space-y-2 rounded-lg border bg-muted/40 p-3">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className="truncate font-medium text-foreground" title={runProgress.message}>
+                    {runProgress.message}
+                  </span>
+                  <span className="shrink-0 tabular-nums text-muted-foreground">
+                    {runProgress.percent}% · {Math.floor(runProgress.elapsedSec)}s
+                  </span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+                  <div
+                    className="h-full rounded-full bg-primary transition-all duration-300 ease-out"
+                    style={{ width: `${Math.max(4, Math.min(100, runProgress.percent))}%` }}
+                  />
+                </div>
+                {runProgress.total > 1 && (
+                  <div className="text-[11px] tabular-nums text-muted-foreground">
+                    Bosqich: {runProgress.current} / {runProgress.total}
+                  </div>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
 

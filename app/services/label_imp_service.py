@@ -5,9 +5,12 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import threading
+import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pymupdf
 
@@ -338,8 +341,17 @@ def run_label_imposition_job(
     max_cylinder_width_mm: float = 0.0,
     export_svg: bool = False,
     export_eps: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Dict[str, Any]:
     """Run Label Imposition on uploaded PDFs or directly on a previous Sela job output."""
+    def _report(cur: int, tot: int, msg: str) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(cur, tot, msg)
+            except Exception:
+                pass
+
+    _report(0, 1, "Fayllar qabul qilinmoqda...")
     job_id, job_dir = create_job("label_imp")
     inputs_dir = job_dir / "inputs"
     outputs_dir = job_dir / "outputs"
@@ -382,6 +394,8 @@ def run_label_imposition_job(
     gm = _get_gear_manager()
     engine = ImpositionEngine(gm)
 
+    _report(0, max(1, len(input_paths)), f"{len(input_paths)} ta PDF fayl tahlil qilinmoqda...")
+
     if combine_same_gear:
         overrides = {str(p): (custom_gear, custom_copies) for p in input_paths}
         results = engine.process_batch_combined_by_gear(
@@ -389,20 +403,39 @@ def run_label_imposition_job(
             output_dir=outputs_dir,
             config=config,
             overrides=overrides,
+            progress_callback=_report,
             group_by_file=separate_by_file,
         )
     else:
+        all_designs = []
+        for idx, p in enumerate(input_paths, start=1):
+            _report(idx, len(input_paths) + 1, f"Fayl tahlil qilinmoqda ({idx}/{len(input_paths)}): {p.name}")
+            all_designs.extend(inspect_pdf_designs(p))
+        total_d = max(1, len(all_designs))
         results = []
-        for p in input_paths:
-            results.extend(
-                engine.process_all_designs_in_file(
-                    p,
-                    output_dir=outputs_dir,
-                    config=config,
-                    custom_gear=custom_gear,
-                    custom_copies=custom_copies,
+        src_docs: Dict[Path, pymupdf.Document] = {}
+        try:
+            for idx, d in enumerate(all_designs, start=1):
+                _report(idx - 1, total_d, f"[{idx}/{total_d}] Montaj qilinmoqda: {d.display_name}...")
+                if d.file_path not in src_docs:
+                    src_docs[d.file_path] = pymupdf.open(d.file_path)
+                results.append(
+                    engine.process_design_info(
+                        d,
+                        output_dir=outputs_dir,
+                        config=config,
+                        custom_gear=custom_gear,
+                        custom_copies=custom_copies,
+                        src_doc=src_docs[d.file_path],
+                    )
                 )
-            )
+        finally:
+            for sd in src_docs.values():
+                try:
+                    sd.close()
+                except Exception:
+                    pass
+        _report(total_d, total_d, "Barcha stikerlar montaj qilindi!")
 
     unique_outputs: List[Path] = []
     seen_out: set[str] = set()
@@ -441,6 +474,7 @@ def run_label_imposition_job(
 
     zip_filename = None
     if len(unique_outputs) > 1:
+        _report(99, 100, f"ZIP arxiv tayyorlanmoqda ({len(unique_outputs)} ta fayl)...")
         zip_path = bundle_job_outputs_zip(job_id, [p.name for p in unique_outputs])
         zip_filename = zip_path.name
 
@@ -455,4 +489,115 @@ def run_label_imposition_job(
         "outputs": [p.name for p in unique_outputs],
     }
     save_job_meta(job_id, payload)
+    _report(100, 100, "Montaj muvaffaqiyatli yakunlandi!")
     return payload
+
+
+_LABEL_IMP_RUNS_LOCK = threading.Lock()
+_LABEL_IMP_RUNS: Dict[str, Dict[str, Any]] = {}
+
+
+def _prune_old_runs(max_age_sec: float = 3600.0, max_entries: int = 50) -> None:
+    now = time.time()
+    stale = [
+        rid
+        for rid, rec in _LABEL_IMP_RUNS.items()
+        if rec["status"] != "running" and (now - rec["updated_at"]) > max_age_sec
+    ]
+    for rid in stale:
+        _LABEL_IMP_RUNS.pop(rid, None)
+    if len(_LABEL_IMP_RUNS) > max_entries:
+        finished = sorted(
+            ((rec["updated_at"], rid) for rid, rec in _LABEL_IMP_RUNS.items() if rec["status"] != "running")
+        )
+        for _, rid in finished[: len(_LABEL_IMP_RUNS) - max_entries]:
+            _LABEL_IMP_RUNS.pop(rid, None)
+
+
+def start_label_imposition_run(**kwargs: Any) -> Dict[str, Any]:
+    """Start label imposition in a background thread and return a pollable run_id."""
+    uploaded_files = kwargs.get("uploaded_files") or []
+    from_job_id = kwargs.get("from_job_id")
+    from_filename = kwargs.get("from_filename")
+    has_pdf = any(Path(fn).name.lower().endswith(".pdf") for fn, _ in uploaded_files)
+    if not has_pdf and not (from_job_id and from_filename):
+        raise ValueError("Kamida bitta PDF fayl yuklang yoki Sela natijasidan yuboring.")
+
+    run_id = uuid.uuid4().hex[:12]
+    now = time.time()
+    record: Dict[str, Any] = {
+        "run_id": run_id,
+        "status": "running",
+        "current": 0,
+        "total": 1,
+        "percent": 0,
+        "message": "Montaj boshlanmoqda...",
+        "started_at": now,
+        "updated_at": now,
+        "result": None,
+        "error": None,
+    }
+    with _LABEL_IMP_RUNS_LOCK:
+        _prune_old_runs()
+        _LABEL_IMP_RUNS[run_id] = record
+
+    def _on_progress(cur: int, tot: int, msg: str) -> None:
+        safe_tot = max(1, int(tot))
+        safe_cur = max(0, min(int(cur), safe_tot))
+        pct = int(round((safe_cur / safe_tot) * 100))
+        with _LABEL_IMP_RUNS_LOCK:
+            rec = _LABEL_IMP_RUNS.get(run_id)
+            if rec is not None and rec["status"] == "running":
+                rec["current"] = safe_cur
+                rec["total"] = safe_tot
+                rec["percent"] = min(99, pct)
+                rec["message"] = msg
+                rec["updated_at"] = time.time()
+
+    def _worker() -> None:
+        try:
+            res = run_label_imposition_job(**kwargs, progress_callback=_on_progress)
+            with _LABEL_IMP_RUNS_LOCK:
+                rec = _LABEL_IMP_RUNS.get(run_id)
+                if rec is not None:
+                    rec["status"] = "done"
+                    rec["percent"] = 100
+                    rec["current"] = rec["total"]
+                    rec["message"] = "Montaj muvaffaqiyatli yakunlandi!"
+                    rec["result"] = res
+                    rec["updated_at"] = time.time()
+        except Exception as exc:
+            with _LABEL_IMP_RUNS_LOCK:
+                rec = _LABEL_IMP_RUNS.get(run_id)
+                if rec is not None:
+                    rec["status"] = "error"
+                    rec["error"] = str(exc)
+                    rec["message"] = str(exc)
+                    rec["updated_at"] = time.time()
+
+    thread = threading.Thread(target=_worker, name=f"label-imp-{run_id}", daemon=True)
+    thread.start()
+    return {"run_id": run_id}
+
+
+def get_label_imposition_run(run_id: str) -> Dict[str, Any]:
+    with _LABEL_IMP_RUNS_LOCK:
+        rec = _LABEL_IMP_RUNS.get(run_id)
+        if rec is None:
+            raise KeyError(f"Montaj jarayoni topilmadi: {run_id}")
+        elapsed = (
+            rec["updated_at"] - rec["started_at"]
+            if rec["status"] != "running"
+            else time.time() - rec["started_at"]
+        )
+        return {
+            "run_id": rec["run_id"],
+            "status": rec["status"],
+            "current": rec["current"],
+            "total": rec["total"],
+            "percent": rec["percent"],
+            "message": rec["message"],
+            "elapsed_sec": round(max(0.0, elapsed), 1),
+            "result": rec["result"],
+            "error": rec["error"],
+        }

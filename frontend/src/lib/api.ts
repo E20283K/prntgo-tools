@@ -185,6 +185,18 @@ export interface LabelRunResponse {
   designs: LabelRunDesign[]
 }
 
+export interface LabelRunStatusResponse {
+  run_id: string
+  status: "running" | "done" | "error"
+  current: number
+  total: number
+  percent: number
+  message: string
+  elapsed_sec: number
+  result?: LabelRunResponse | null
+  error?: string | null
+}
+
 export interface PrintPreset {
   name: string
   description: string

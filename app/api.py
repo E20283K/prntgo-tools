@@ -628,6 +628,72 @@ async def label_imp_run(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/api/label-imp/run/start", dependencies=[Depends(require_auth)])
+async def label_imp_run_start(
+    files: Optional[List[UploadFile]] = File(None),
+    from_job_id: Optional[str] = Form(None),
+    from_filename: Optional[str] = Form(None),
+    custom_gear: Optional[str] = Form(None),
+    custom_copies: Optional[str] = Form(None),
+    rotation_mode: str = Form("auto"),
+    combine_same_gear: bool = Form(True),
+    separate_by_file: bool = Form(False),
+    separate_colors: bool = Form(True),
+    color_output_mode: str = Form("side_by_side"),
+    remove_outer_border: bool = Form(True),
+    regmark_enabled: bool = Form(True),
+    regmark_stroke_mm: float = Form(0.2),
+    regmark_tick_mm: float = Form(0.7),
+    regmark_custom_width_mm: Optional[str] = Form(None),
+    column_gap_mm: float = Form(5.0),
+    max_cylinder_width_mm: float = Form(0.0),
+    export_svg: bool = Form(False),
+    export_eps: bool = Form(False),
+) -> Dict[str, Any]:
+    """Start label imposition in background; poll /api/label-imp/runs/{run_id} for live progress."""
+    try:
+        uploaded: List[tuple[str, bytes]] = []
+        for f in (files or []):
+            if f.filename:
+                uploaded.append((f.filename, await f.read()))
+
+        gear_val = int(custom_gear) if (custom_gear and custom_gear.strip().isdigit()) else None
+        copies_val = int(custom_copies) if (custom_copies and custom_copies.strip().isdigit()) else None
+        rm_w = float(regmark_custom_width_mm) if (regmark_custom_width_mm and regmark_custom_width_mm.strip()) else None
+
+        return label_imp_service.start_label_imposition_run(
+            uploaded_files=uploaded,
+            from_job_id=from_job_id or None,
+            from_filename=from_filename or None,
+            custom_gear=gear_val,
+            custom_copies=copies_val,
+            rotation_mode=rotation_mode,
+            combine_same_gear=combine_same_gear,
+            separate_by_file=separate_by_file,
+            separate_colors=separate_colors,
+            color_output_mode=color_output_mode,
+            remove_outer_border=remove_outer_border,
+            regmark_enabled=regmark_enabled,
+            regmark_stroke_mm=regmark_stroke_mm,
+            regmark_tick_mm=regmark_tick_mm,
+            regmark_custom_width_mm=rm_w,
+            column_gap_mm=column_gap_mm,
+            max_cylinder_width_mm=max_cylinder_width_mm,
+            export_svg=export_svg,
+            export_eps=export_eps,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/label-imp/runs/{run_id}", dependencies=[Depends(require_auth)])
+def label_imp_run_status(run_id: str) -> Dict[str, Any]:
+    try:
+        return label_imp_service.get_label_imposition_run(run_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e).strip("'\""))
+
+
 # ---------------------------------------------------------------------------
 # 3. PRINT IMPOSITION (OFFSET / DIGITAL SHEET) ENDPOINTS
 # ---------------------------------------------------------------------------
