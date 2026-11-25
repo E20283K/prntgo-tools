@@ -373,12 +373,28 @@ _STREAM_TOKEN_RE = re.compile(
 )
 
 
+_NUM_START = frozenset("0123456789-+.")
+_OPERAND_START = frozenset("0123456789-+./(<[")
+
+
 def _is_num(tok: str) -> bool:
-    try:
-        float(tok)
-        return True
-    except ValueError:
-        return False
+    return bool(tok) and tok[0] in _NUM_START
+
+
+def _mul_matrix(
+    m1: Tuple[float, float, float, float, float, float],
+    m2: Tuple[float, float, float, float, float, float],
+) -> Tuple[float, float, float, float, float, float]:
+    a1, b1, c1, d1, e1, f1 = m1
+    a2, b2, c2, d2, e2, f2 = m2
+    return (
+        a1 * a2 + b1 * c2,
+        a1 * b2 + b1 * d2,
+        c1 * a2 + d1 * c2,
+        c1 * b2 + d1 * d2,
+        e1 * a2 + f1 * c2 + e2,
+        e1 * b2 + f1 * d2 + f2,
+    )
 
 
 def _isolate_sticker_and_remove_border_from_stream(
@@ -405,13 +421,21 @@ def _isolate_sticker_and_remove_border_from_stream(
     tx0, ty0, tx1, ty1 = target_pdf_rect
     outside_tol = 2.5
     border_tol = 2.2
+    tx0_out = tx0 - outside_tol
+    tx1_out = tx1 + outside_tol
+    ty0_out = ty0 - outside_tol
+    ty1_out = ty1 + outside_tol
+    tx0_txt = tx0 - 3.5
+    tx1_txt = tx1 + 3.5
+    ty0_txt = ty0 - 3.5
+    ty1_txt = ty1 + 3.5
 
-    tokens = [m.group(0) for m in _STREAM_TOKEN_RE.finditer(text)]
     out_cmds: List[str] = []
     operands: List[str] = []
 
-    ctm = pymupdf.Matrix(1, 0, 0, 1, 0, 0)
-    ctm_stack: List[pymupdf.Matrix] = []
+    ctm: Tuple[float, float, float, float, float, float] = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    ctm_is_id = True
+    ctm_stack: List[Tuple[Tuple[float, float, float, float, float, float], bool]] = []
 
     # Text block buffering state
     in_bt = False
@@ -419,26 +443,40 @@ def _isolate_sticker_and_remove_border_from_stream(
     bt_has_tf = False
     active_font_cmd: Optional[str] = None
     font_stack: List[Optional[str]] = []
-    tm = pymupdf.Matrix(1, 0, 0, 1, 0, 0)
-    tlm = pymupdf.Matrix(1, 0, 0, 1, 0, 0)
-    bt_points: List[pymupdf.Point] = []
+    tm: Tuple[float, float, float, float, float, float] = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    tlm: Tuple[float, float, float, float, float, float] = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    bt_points: List[Tuple[float, float]] = []
 
     # Path construction buffering state
     path_cmds: List[str] = []
-    path_points: List[pymupdf.Point] = []
+    path_has_pts = False
+    p_min_x = 0.0
+    p_max_x = 0.0
+    p_min_y = 0.0
+    p_max_y = 0.0
+    # Only keep explicit points for small paths (<= 8 segments) that might be a curved outer border
+    path_points: List[Tuple[float, float]] = []
     path_has_curves = False
     path_seg_count = 0
 
-    def point_in_target(pt: pymupdf.Point, tol: float = outside_tol) -> bool:
-        return (tx0 - tol) <= pt.x <= (tx1 + tol) and (ty0 - tol) <= pt.y <= (ty1 + tol)
+    op_start = _OPERAND_START
+    num_start = _NUM_START
+    out_append = out_cmds.append
+    ops_append = operands.append
+    ops_clear = operands.clear
+    path_append = path_cmds.append
 
-    for tok in tokens:
-        if _is_num(tok) or tok.startswith(("/", "(", "<", "[")):
-            operands.append(tok)
+    for m in _STREAM_TOKEN_RE.finditer(text):
+        tok = m.group(0)
+        if tok[0] in op_start:
+            ops_append(tok)
             continue
 
         op = tok
-        cmd_str = (" ".join(operands) + " " + op).strip()
+        if operands:
+            cmd_str = " ".join(operands) + " " + op
+        else:
+            cmd_str = op
 
         # Inside a BT ... ET text object
         if in_bt:
@@ -446,27 +484,226 @@ def _isolate_sticker_and_remove_border_from_stream(
             if op == "Tf":
                 active_font_cmd = cmd_str
                 bt_has_tf = True
-            elif op == "Tm" and len(operands) >= 6 and all(_is_num(x) for x in operands[-6:]):
-                vals = [float(x) for x in operands[-6:]]
-                tm = pymupdf.Matrix(*vals)
-                tlm = pymupdf.Matrix(*vals)
-            elif op in ("Td", "TD") and len(operands) >= 2 and all(_is_num(x) for x in operands[-2:]):
+            elif op == "Tm" and len(operands) >= 6 and operands[-6][0] in num_start:
+                tm = (
+                    float(operands[-6]), float(operands[-5]),
+                    float(operands[-4]), float(operands[-3]),
+                    float(operands[-2]), float(operands[-1]),
+                )
+                tlm = tm
+            elif op in ("Td", "TD") and len(operands) >= 2 and operands[-2][0] in num_start:
                 dx, dy = float(operands[-2]), float(operands[-1])
-                tlm = pymupdf.Matrix(1, 0, 0, 1, dx, dy) * tlm
-                tm = pymupdf.Matrix(tlm)
+                tlm = _mul_matrix((1.0, 0.0, 0.0, 1.0, dx, dy), tlm)
+                tm = tlm
             elif op in ("Tj", "TJ", "'", '"'):
-                bt_points.append(pymupdf.Point(tm.e, tm.f) * ctm)
+                if ctm_is_id:
+                    bt_points.append((tm[4], tm[5]))
+                else:
+                    bt_points.append((tm[4] * ctm[0] + tm[5] * ctm[2] + ctm[4], tm[4] * ctm[1] + tm[5] * ctm[3] + ctm[5]))
             elif op == "ET":
                 in_bt = False
                 # Keep BT..ET only if its text position falls inside target_pdf_rect
-                if not bt_points or any(point_in_target(p, tol=3.5) for p in bt_points):
+                if not bt_points or any(tx0_txt <= px <= tx1_txt and ty0_txt <= py <= ty1_txt for px, py in bt_points):
                     if not bt_has_tf and active_font_cmd:
                         bt_cmds.insert(1, active_font_cmd)
                     out_cmds.extend(bt_cmds)
                 bt_cmds.clear()
                 bt_points.clear()
                 bt_has_tf = False
-            operands.clear()
+            ops_clear()
+            continue
+
+        # Fast-path the most common path construction operators first (`c`, `l`, `m`, `v`, `y`, `re`, `h`)
+        if op == "c" and len(operands) >= 6:
+            x1 = float(operands[-6]); y1 = float(operands[-5])
+            x2 = float(operands[-4]); y2 = float(operands[-3])
+            x3 = float(operands[-2]); y3 = float(operands[-1])
+            if not ctm_is_id:
+                ca, cb, cc, cd, ce, cf = ctm
+                x1, y1 = x1 * ca + y1 * cc + ce, x1 * cb + y1 * cd + cf
+                x2, y2 = x2 * ca + y2 * cc + ce, x2 * cb + y2 * cd + cf
+                x3, y3 = x3 * ca + y3 * cc + ce, x3 * cb + y3 * cd + cf
+            if not path_has_pts:
+                p_min_x = p_max_x = x1
+                p_min_y = p_max_y = y1
+                path_has_pts = True
+            else:
+                if x1 < p_min_x: p_min_x = x1
+                elif x1 > p_max_x: p_max_x = x1
+                if y1 < p_min_y: p_min_y = y1
+                elif y1 > p_max_y: p_max_y = y1
+            if x2 < p_min_x: p_min_x = x2
+            elif x2 > p_max_x: p_max_x = x2
+            if y2 < p_min_y: p_min_y = y2
+            elif y2 > p_max_y: p_max_y = y2
+            if x3 < p_min_x: p_min_x = x3
+            elif x3 > p_max_x: p_max_x = x3
+            if y3 < p_min_y: p_min_y = y3
+            elif y3 > p_max_y: p_max_y = y3
+            path_has_curves = True
+            path_seg_count += 1
+            if path_seg_count <= 8:
+                path_points.append((x1, y1))
+                path_points.append((x2, y2))
+                path_points.append((x3, y3))
+            path_append(cmd_str)
+            ops_clear()
+            continue
+
+        if op == "l" and len(operands) >= 2:
+            x = float(operands[-2]); y = float(operands[-1])
+            if not ctm_is_id:
+                ca, cb, cc, cd, ce, cf = ctm
+                x, y = x * ca + y * cc + ce, x * cb + y * cd + cf
+            if not path_has_pts:
+                p_min_x = p_max_x = x
+                p_min_y = p_max_y = y
+                path_has_pts = True
+            else:
+                if x < p_min_x: p_min_x = x
+                elif x > p_max_x: p_max_x = x
+                if y < p_min_y: p_min_y = y
+                elif y > p_max_y: p_max_y = y
+            path_seg_count += 1
+            if path_seg_count <= 8:
+                path_points.append((x, y))
+            path_append(cmd_str)
+            ops_clear()
+            continue
+
+        if op == "m" and len(operands) >= 2:
+            x = float(operands[-2]); y = float(operands[-1])
+            if not ctm_is_id:
+                ca, cb, cc, cd, ce, cf = ctm
+                x, y = x * ca + y * cc + ce, x * cb + y * cd + cf
+            if not path_has_pts:
+                p_min_x = p_max_x = x
+                p_min_y = p_max_y = y
+                path_has_pts = True
+            else:
+                if x < p_min_x: p_min_x = x
+                elif x > p_max_x: p_max_x = x
+                if y < p_min_y: p_min_y = y
+                elif y > p_max_y: p_max_y = y
+            if path_seg_count <= 8:
+                path_points.append((x, y))
+            path_append(cmd_str)
+            ops_clear()
+            continue
+
+        if op == "h" and not operands:
+            path_append("h")
+            continue
+
+        # Path painting / ending operators
+        if not operands and op in ("f", "f*", "F", "S", "s", "B", "B*", "b", "b*", "n"):
+            if path_has_pts:
+                inside = (
+                    p_min_x >= tx0_out
+                    and p_max_x <= tx1_out
+                    and p_min_y >= ty0_out
+                    and p_max_y <= ty1_out
+                )
+
+                is_outer_border = False
+                if (
+                    remove_border
+                    and path_seg_count <= 8
+                    and op in ("S", "s", "B", "B*", "b", "b*")
+                ):
+                    if (
+                        abs(p_min_x - tx0) <= border_tol
+                        and abs(p_max_x - tx1) <= border_tol
+                        and abs(p_min_y - ty0) <= border_tol
+                        and abs(p_max_y - ty1) <= border_tol
+                    ):
+                        if not path_has_curves or all(
+                            (
+                                abs(px - tx0) <= border_tol
+                                or abs(px - tx1) <= border_tol
+                                or abs(py - ty0) <= border_tol
+                                or abs(py - ty1) <= border_tol
+                            )
+                            for px, py in path_points
+                        ):
+                            is_outer_border = True
+
+                # Also drop any `W n` clipping rectangle so CorelDRAW doesn't import clip boxes as borders
+                has_clip_op = (op == "n") and any(c in ("W", "W*") for c in path_cmds)
+
+                if inside and not is_outer_border and not has_clip_op:
+                    out_cmds.extend(path_cmds)
+                    out_append(op)
+
+            path_cmds.clear()
+            path_points.clear()
+            path_has_pts = False
+            path_has_curves = False
+            path_seg_count = 0
+            continue
+
+        if op in ("v", "y") and len(operands) >= 4:
+            x1 = float(operands[-4]); y1 = float(operands[-3])
+            x2 = float(operands[-2]); y2 = float(operands[-1])
+            if not ctm_is_id:
+                ca, cb, cc, cd, ce, cf = ctm
+                x1, y1 = x1 * ca + y1 * cc + ce, x1 * cb + y1 * cd + cf
+                x2, y2 = x2 * ca + y2 * cc + ce, x2 * cb + y2 * cd + cf
+            if not path_has_pts:
+                p_min_x = p_max_x = x1
+                p_min_y = p_max_y = y1
+                path_has_pts = True
+            else:
+                if x1 < p_min_x: p_min_x = x1
+                elif x1 > p_max_x: p_max_x = x1
+                if y1 < p_min_y: p_min_y = y1
+                elif y1 > p_max_y: p_max_y = y1
+            if x2 < p_min_x: p_min_x = x2
+            elif x2 > p_max_x: p_max_x = x2
+            if y2 < p_min_y: p_min_y = y2
+            elif y2 > p_max_y: p_max_y = y2
+            path_has_curves = True
+            path_seg_count += 1
+            if path_seg_count <= 8:
+                path_points.append((x1, y1))
+                path_points.append((x2, y2))
+            path_append(cmd_str)
+            ops_clear()
+            continue
+
+        if op == "re" and len(operands) >= 4:
+            rx = float(operands[-4]); ry = float(operands[-3])
+            rw = float(operands[-2]); rh = float(operands[-1])
+            x1, y1 = rx, ry
+            x2, y2 = rx + rw, ry + rh
+            if not ctm_is_id:
+                ca, cb, cc, cd, ce, cf = ctm
+                x1, y1 = x1 * ca + y1 * cc + ce, x1 * cb + y1 * cd + cf
+                x2, y2 = x2 * ca + y2 * cc + ce, x2 * cb + y2 * cd + cf
+            if not path_has_pts:
+                p_min_x = p_max_x = x1
+                p_min_y = p_max_y = y1
+                path_has_pts = True
+            else:
+                if x1 < p_min_x: p_min_x = x1
+                elif x1 > p_max_x: p_max_x = x1
+                if y1 < p_min_y: p_min_y = y1
+                elif y1 > p_max_y: p_max_y = y1
+            if x2 < p_min_x: p_min_x = x2
+            elif x2 > p_max_x: p_max_x = x2
+            if y2 < p_min_y: p_min_y = y2
+            elif y2 > p_max_y: p_max_y = y2
+            path_seg_count += 1
+            if path_seg_count <= 8:
+                path_points.append((x1, y1))
+                path_points.append((x2, y2))
+            path_append(cmd_str)
+            ops_clear()
+            continue
+
+        # Clipping path operators
+        if not operands and op in ("W", "W*"):
+            path_append(op)
             continue
 
         if op == "Tf":
@@ -476,147 +713,41 @@ def _isolate_sticker_and_remove_border_from_stream(
             in_bt = True
             bt_cmds = ["BT"]
             bt_has_tf = False
-            tm = pymupdf.Matrix(1, 0, 0, 1, 0, 0)
-            tlm = pymupdf.Matrix(1, 0, 0, 1, 0, 0)
+            tm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            tlm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
             bt_points.clear()
-            operands.clear()
-            continue
-
-        # Path construction operators
-        if op == "m" and len(operands) >= 2 and all(_is_num(x) for x in operands[-2:]):
-            x, y = float(operands[-2]), float(operands[-1])
-            path_points.append(pymupdf.Point(x, y) * ctm)
-            path_cmds.append(cmd_str)
-            operands.clear()
-            continue
-
-        if op == "l" and len(operands) >= 2 and all(_is_num(x) for x in operands[-2:]):
-            x, y = float(operands[-2]), float(operands[-1])
-            path_points.append(pymupdf.Point(x, y) * ctm)
-            path_seg_count += 1
-            path_cmds.append(cmd_str)
-            operands.clear()
-            continue
-
-        if op == "c" and len(operands) >= 6 and all(_is_num(x) for x in operands[-6:]):
-            vals = [float(x) for x in operands[-6:]]
-            path_points.append(pymupdf.Point(vals[0], vals[1]) * ctm)
-            path_points.append(pymupdf.Point(vals[2], vals[3]) * ctm)
-            path_points.append(pymupdf.Point(vals[4], vals[5]) * ctm)
-            path_has_curves = True
-            path_seg_count += 1
-            path_cmds.append(cmd_str)
-            operands.clear()
-            continue
-
-        if op in ("v", "y") and len(operands) >= 4 and all(_is_num(x) for x in operands[-4:]):
-            vals = [float(x) for x in operands[-4:]]
-            path_points.append(pymupdf.Point(vals[0], vals[1]) * ctm)
-            path_points.append(pymupdf.Point(vals[2], vals[3]) * ctm)
-            path_has_curves = True
-            path_seg_count += 1
-            path_cmds.append(cmd_str)
-            operands.clear()
-            continue
-
-        if op == "re" and len(operands) >= 4 and all(_is_num(x) for x in operands[-4:]):
-            x, y, w, h = (float(operands[-4]), float(operands[-3]), float(operands[-2]), float(operands[-1]))
-            path_points.append(pymupdf.Point(x, y) * ctm)
-            path_points.append(pymupdf.Point(x + w, y + h) * ctm)
-            path_seg_count += 1
-            path_cmds.append(cmd_str)
-            operands.clear()
-            continue
-
-        if op == "h" and not operands:
-            path_cmds.append("h")
-            operands.clear()
-            continue
-
-        # Clipping path operators: drop clipping operator if path is outside or matches sticker/page box
-        if op in ("W", "W*") and not operands:
-            path_cmds.append(op)
-            operands.clear()
-            continue
-
-        # Path painting / ending operators
-        if op in ("S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n") and not operands:
-            if path_points:
-                min_x = min(p.x for p in path_points)
-                max_x = max(p.x for p in path_points)
-                min_y = min(p.y for p in path_points)
-                max_y = max(p.y for p in path_points)
-
-                inside = (
-                    min_x >= (tx0 - outside_tol)
-                    and max_x <= (tx1 + outside_tol)
-                    and min_y >= (ty0 - outside_tol)
-                    and max_y <= (ty1 + outside_tol)
-                )
-
-                is_outer_border = False
-                if (
-                    remove_border
-                    and op in ("S", "s", "B", "B*", "b", "b*")
-                    and path_seg_count <= 8
-                ):
-                    if (
-                        abs(min_x - tx0) <= border_tol
-                        and abs(max_x - tx1) <= border_tol
-                        and abs(min_y - ty0) <= border_tol
-                        and abs(max_y - ty1) <= border_tol
-                    ):
-                        if not path_has_curves or all(
-                            (
-                                abs(p.x - tx0) <= border_tol
-                                or abs(p.x - tx1) <= border_tol
-                                or abs(p.y - ty0) <= border_tol
-                                or abs(p.y - ty1) <= border_tol
-                            )
-                            for p in path_points
-                        ):
-                            is_outer_border = True
-
-                # Also drop any `W n` clipping rectangle so CorelDRAW doesn't import clip boxes as borders
-                has_clip_op = any(c in ("W", "W*") for c in path_cmds)
-
-                if inside and not is_outer_border and not (op == "n" and has_clip_op):
-                    out_cmds.extend(path_cmds)
-                    out_cmds.append(op)
-
-            path_cmds.clear()
-            path_points.clear()
-            path_has_curves = False
-            path_seg_count = 0
-            operands.clear()
+            ops_clear()
             continue
 
         # Graphics state stack & CTM
         if op == "q" and not operands:
-            ctm_stack.append(pymupdf.Matrix(ctm))
+            ctm_stack.append((ctm, ctm_is_id))
             font_stack.append(active_font_cmd)
-            out_cmds.append("q")
-            operands.clear()
+            out_append("q")
             continue
 
         if op == "Q" and not operands:
             if ctm_stack:
-                ctm = ctm_stack.pop()
+                ctm, ctm_is_id = ctm_stack.pop()
             if font_stack:
                 active_font_cmd = font_stack.pop()
-            out_cmds.append("Q")
-            operands.clear()
+            out_append("Q")
             continue
 
-        if op == "cm" and len(operands) >= 6 and all(_is_num(x) for x in operands[-6:]):
-            vals = [float(x) for x in operands[-6:]]
-            ctm = pymupdf.Matrix(*vals) * ctm
-            out_cmds.append(cmd_str)
-            operands.clear()
+        if op == "cm" and len(operands) >= 6 and operands[-6][0] in num_start:
+            m_new = (
+                float(operands[-6]), float(operands[-5]),
+                float(operands[-4]), float(operands[-3]),
+                float(operands[-2]), float(operands[-1]),
+            )
+            ctm = m_new if ctm_is_id else _mul_matrix(m_new, ctm)
+            ctm_is_id = (ctm == (1.0, 0.0, 0.0, 1.0, 0.0, 0.0))
+            out_append(cmd_str)
+            ops_clear()
             continue
 
-        out_cmds.append(cmd_str)
-        operands.clear()
+        out_append(cmd_str)
+        ops_clear()
 
     # Translate sticker origin from (tx0, ty0) to (0, 0) in PDF user space
     translate_prefix = f"q 1 0 0 1 {-tx0:.4f} {-ty0:.4f} cm\n"
@@ -763,13 +894,14 @@ def _inline_form_xobjects(
     if "Do" not in text:
         return stream_bytes, set()
 
-    tokens = [m.group(0) for m in _STREAM_TOKEN_RE.finditer(text)]
     out_cmds: List[str] = []
     operands: List[str] = []
     inlined_names: set[str] = set()
+    op_start = _OPERAND_START
 
-    for tok in tokens:
-        if _is_num(tok) or tok.startswith(("/", "(", "<", "[")):
+    for m in _STREAM_TOKEN_RE.finditer(text):
+        tok = m.group(0)
+        if tok[0] in op_start:
             operands.append(tok)
             continue
         op = tok
@@ -803,10 +935,11 @@ def prepare_borderless_source_doc(
     info: Optional[PDFDesignInfo] = None,
     remove_border: bool = True,
     page_index: int = 0,
+    src_doc: Optional[pymupdf.Document] = None,
 ) -> Tuple[pymupdf.Document, pymupdf.Rect]:
     """
-    Opens the source PDF and creates a pure, isolated 1-page vector PDF for `info`
-    with exact dimensions `(0, 0, width_pt, height_pt)`:
+    Opens the source PDF (or reuses an already-open `src_doc`) and creates a pure, isolated 1-page
+    vector PDF for `info` with exact dimensions `(0, 0, width_pt, height_pt)`:
     - Physically deletes all vectors and text belonging to other stickers on a multi-sticker sheet
       (including nested Form XObjects such as `/fullpage`).
     - Physically deletes the outer border rectangle (`hoshiya`) without using `re W n` clipping masks.
@@ -815,19 +948,33 @@ def prepare_borderless_source_doc(
     if info is None:
         info = inspect_pdf_design(pdf_path, page_index=page_index)
 
-    src_doc = pymupdf.open(pdf_path)
+    owns_src = src_doc is None
+    if src_doc is None:
+        src_doc = pymupdf.open(pdf_path)
     try:
         design_rect = pymupdf.Rect(info.design_rect_pt)
 
         doc = pymupdf.open()
         doc.insert_pdf(src_doc, from_page=info.page_index, to_page=info.page_index)
         page = doc[0]
-        page.clean_contents()
+
+        is_full_page = (
+            abs(design_rect.x0 - info.page_rect_pt.x0) <= 1.0
+            and abs(design_rect.y0 - info.page_rect_pt.y0) <= 1.0
+            and abs(design_rect.x1 - info.page_rect_pt.x1) <= 1.0
+            and abs(design_rect.y1 - info.page_rect_pt.y1) <= 1.0
+        )
+        needs_border_removal = bool(remove_border and info.has_outer_border)
+        needs_compaction = False
 
         xrefs = page.get_contents()
         if xrefs:
+            # Combine multiple content streams into one only when needed
+            if len(xrefs) > 1:
+                page.clean_contents()
+                xrefs = page.get_contents()
+
             raw_stream = page.read_contents()
-            raw_stream, inlined_xobjs = _inline_form_xobjects(doc, page.xref, page.xref, raw_stream)
             inv_mat = ~page.transformation_matrix
             p0 = pymupdf.Point(design_rect.x0, design_rect.y0) * inv_mat
             p1 = pymupdf.Point(design_rect.x1, design_rect.y1) * inv_mat
@@ -837,39 +984,47 @@ def prepare_borderless_source_doc(
                 max(p0.x, p1.x),
                 max(p0.y, p1.y),
             )
+            tx0, ty0, _, _ = target_pdf_rect
 
-            isolated_stream = _isolate_sticker_and_remove_border_from_stream(
-                raw_stream,
-                target_pdf_rect=target_pdf_rect,
-                remove_border=remove_border and info.has_outer_border,
-            )
-            doc.update_stream(xrefs[0], isolated_stream)
+            # Fast path: single full-page sticker with no border to remove and no Form XObjects to crop
+            if is_full_page and not needs_border_removal:
+                if abs(tx0) > 0.05 or abs(ty0) > 0.05:
+                    prefix = f"q 1 0 0 1 {-tx0:.4f} {-ty0:.4f} cm\n".encode("latin1")
+                    doc.update_stream(xrefs[0], prefix + raw_stream + b"\nQ\n")
+            else:
+                raw_stream, inlined_xobjs = _inline_form_xobjects(doc, page.xref, page.xref, raw_stream)
+                isolated_stream = _isolate_sticker_and_remove_border_from_stream(
+                    raw_stream,
+                    target_pdf_rect=target_pdf_rect,
+                    remove_border=needs_border_removal,
+                )
+                doc.update_stream(xrefs[0], isolated_stream)
 
-            if inlined_xobjs:
-                try:
-                    xmap = _get_xobject_map(doc, page.xref)
-                    kept_xobjs = [
-                        f"{k} {v} 0 R" for k, v in xmap.items() if k not in inlined_xobjs
-                    ]
-                    doc.xref_set_key(page.xref, "Resources/XObject", "<<" + " ".join(kept_xobjs) + ">>")
-                except Exception:
-                    pass
+                if inlined_xobjs:
+                    needs_compaction = True
+                    try:
+                        xmap = _get_xobject_map(doc, page.xref)
+                        kept_xobjs = [
+                            f"{k} {v} 0 R" for k, v in xmap.items() if k not in inlined_xobjs
+                        ]
+                        doc.xref_set_key(page.xref, "Resources/XObject", "<<" + " ".join(kept_xobjs) + ">>")
+                    except Exception:
+                        pass
 
-            # Prune unused font references from page Resources/Font so multi-megabyte unused fonts
-            # from other stickers on a sheet are garbage-collected upon save
-            try:
-                stream_str = isolated_stream.decode("latin1", errors="ignore")
-                used_fonts = set(re.findall(r"/([A-Za-z0-9_.\-+]+)\s+[-+]?\d*\.?\d+\s+Tf\b", stream_str))
-                fdict_type, fdict_val = doc.xref_get_key(page.xref, "Resources/Font")
-                if fdict_type == "dict" and fdict_val:
-                    kept = [
-                        m.group(0)
-                        for m in re.finditer(r"/([A-Za-z0-9_.\-+]+)\s+\d+\s+0\s+R", fdict_val)
-                        if m.group(1) in used_fonts
-                    ]
-                    doc.xref_set_key(page.xref, "Resources/Font", "<<" + " ".join(kept) + ">>")
-            except Exception:
-                pass
+                # Prune unused font references from page Resources/Font when extracting from a multi-sticker page
+                if not is_full_page or inlined_xobjs:
+                    try:
+                        stream_str = isolated_stream.decode("latin1", errors="ignore")
+                        used_fonts = set(re.findall(r"/([A-Za-z0-9_.\-+]+)\s+[-+]?\d*\.?\d+\s+Tf\b", stream_str))
+                        fdict_type, fdict_val = doc.xref_get_key(page.xref, "Resources/Font")
+                        if fdict_type == "dict" and fdict_val:
+                            all_fonts = list(re.finditer(r"/([A-Za-z0-9_.\-+]+)\s+\d+\s+0\s+R", fdict_val))
+                            kept = [m.group(0) for m in all_fonts if m.group(1) in used_fonts]
+                            if len(kept) < len(all_fonts):
+                                doc.xref_set_key(page.xref, "Resources/Font", "<<" + " ".join(kept) + ">>")
+                                needs_compaction = True
+                    except Exception:
+                        pass
 
         norm_rect = pymupdf.Rect(0.0, 0.0, design_rect.width, design_rect.height)
         page.set_mediabox(norm_rect)
@@ -879,10 +1034,14 @@ def prepare_borderless_source_doc(
         mb = page.mediabox
         page.set_cropbox(mb)
 
-        # Garbage-collect unreferenced Form XObjects and fonts immediately in memory
-        compact_bytes = doc.tobytes(garbage=3)
-        doc.close()
-        clean_doc = pymupdf.open("pdf", compact_bytes)
-        return clean_doc, clean_doc[0].mediabox
+        # Only garbage-collect in memory when we actually pruned unreferenced Form XObjects or fonts;
+        # use garbage=2 (O(N)) instead of garbage=3 to avoid quadratic object comparison overhead.
+        if needs_compaction:
+            compact_bytes = doc.tobytes(garbage=2)
+            doc.close()
+            clean_doc = pymupdf.open("pdf", compact_bytes)
+            return clean_doc, clean_doc[0].mediabox
+        return doc, mb
     finally:
-        src_doc.close()
+        if owns_src:
+            src_doc.close()

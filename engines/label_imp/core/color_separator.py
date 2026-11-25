@@ -202,12 +202,44 @@ _TOKEN_RE = re.compile(
 )
 
 
-def _is_number(tok: str) -> bool:
-    try:
-        float(tok)
+_NUM_START = frozenset("0123456789-+.")
+_OPERAND_START = frozenset("0123456789-+./(<[")
+
+# Fast byte-level checks to skip tokenizing streams that are already 100% pure Grayscale Black/White
+_NON_GRAY_OP_BYTES_RE = re.compile(
+    rb"(?<![A-Za-z0-9_/\-])(?:rg|RG|k|K|sc|SC|scn|SCN|cs|CS)(?![A-Za-z0-9_])"
+)
+_GRAY_OP_VAL_BYTES_RE = re.compile(
+    rb"(?:^|[\s\[\(\<])([-+]?(?:\d+\.?\d*|\.\d+))\s+[gG](?![A-Za-z0-9_])"
+)
+_SPOT_OP_BYTES_RE = re.compile(
+    rb"(?<![A-Za-z0-9_/\-])(?:sc|SC|scn|SCN)(?![A-Za-z0-9_])"
+)
+_PURE_BW_BYTES = frozenset((b"0", b"0.0", b"0.00", b"0.000", b"1", b"1.0", b"1.00", b"1.000"))
+
+
+def _stream_needs_monochromizing(stream_bytes: bytes) -> bool:
+    """
+    Fast C-level regex check: returns False if `stream_bytes` is guaranteed to contain
+    no RGB/CMYK/Spot/ColorSpace operators and only pure 0/1 grayscale (`0 g`/`1 g`/`0 G`/`1 G`).
+    May return True conservatively (e.g. if a text string contains 'k'), never False inaccurately.
+    """
+    if _NON_GRAY_OP_BYTES_RE.search(stream_bytes) is not None:
         return True
-    except ValueError:
-        return False
+    for m in _GRAY_OP_VAL_BYTES_RE.finditer(stream_bytes):
+        val = m.group(1)
+        if val not in _PURE_BW_BYTES:
+            try:
+                f = float(val)
+                if 0.005 < f < 0.96:
+                    return True
+            except ValueError:
+                return True
+    return False
+
+
+def _is_number(tok: str) -> bool:
+    return bool(tok) and tok[0] in _NUM_START
 
 
 def _extract_colors_from_stream_bytes(
@@ -355,13 +387,15 @@ def _filter_and_monochromize_stream(
       preserves white knockout elements (`1 g` / `1 G`), and turns non-matching operations of other colors
       into no-ops (`n` for paths, omitted for text).
     """
+    if target_rgb is None and not _stream_needs_monochromizing(stream_bytes):
+        return stream_bytes
+
     try:
         text = stream_bytes.decode("latin1")
     except Exception:
         return stream_bytes
 
     spot_map = spot_cs_map or {}
-    tokens = [m.group(0) for m in _TOKEN_RE.finditer(text)]
     output_commands: List[str] = []
     operands: List[str] = []
 
@@ -382,9 +416,15 @@ def _filter_and_monochromize_stream(
             return True
         return rgb_distance(rgb, target_rgb) <= tolerance
 
-    for tok in tokens:
-        if _is_number(tok) or tok.startswith(("/", "(", "<", "[")):
-            operands.append(tok)
+    op_start = _OPERAND_START
+    out_append = output_commands.append
+    ops_append = operands.append
+    ops_clear = operands.clear
+
+    for m in _TOKEN_RE.finditer(text):
+        tok = m.group(0)
+        if tok[0] in op_start:
+            ops_append(tok)
             continue
 
         op = tok
@@ -556,20 +596,35 @@ def _process_doc_streams(
     tolerance: float = 0.22,
 ) -> None:
     """Applies `_filter_and_monochromize_stream` to all pages and Form XObjects in `doc`."""
-    spot_map = _extract_spot_colors_from_doc(doc)
-    visited_xrefs = set()
+    spot_map: Optional[Dict[str, Tuple[float, float, float]]] = None
+    visited_xrefs: set[int] = set()
+
+    def _get_spot_map(raw_bytes: bytes) -> Dict[str, Tuple[float, float, float]]:
+        nonlocal spot_map
+        if spot_map is None:
+            if _SPOT_OP_BYTES_RE.search(raw_bytes) is not None:
+                spot_map = _extract_spot_colors_from_doc(doc)
+            else:
+                return {}
+        return spot_map
 
     for page in doc:
-        page.clean_contents()
-        for xref in page.get_contents():
+        xrefs = page.get_contents()
+        if len(xrefs) > 1:
+            page.clean_contents()
+            xrefs = page.get_contents()
+        for xref in xrefs:
             if xref not in visited_xrefs:
                 visited_xrefs.add(xref)
                 raw = doc.xref_stream(xref)
                 if raw:
+                    if target_rgb is None and not _stream_needs_monochromizing(raw):
+                        continue
                     updated = _filter_and_monochromize_stream(
-                        raw, target_rgb=target_rgb, tolerance=tolerance, spot_cs_map=spot_map
+                        raw, target_rgb=target_rgb, tolerance=tolerance, spot_cs_map=_get_spot_map(raw)
                     )
-                    doc.update_stream(xref, updated)
+                    if updated != raw:
+                        doc.update_stream(xref, updated)
 
     # Also process any Form XObject streams across the PDF xref table
     for xref in range(1, doc.xref_length()):
@@ -583,10 +638,13 @@ def _process_doc_streams(
                 visited_xrefs.add(xref)
                 raw = doc.xref_stream(xref)
                 if raw:
+                    if target_rgb is None and not _stream_needs_monochromizing(raw):
+                        continue
                     updated = _filter_and_monochromize_stream(
-                        raw, target_rgb=target_rgb, tolerance=tolerance, spot_cs_map=spot_map
+                        raw, target_rgb=target_rgb, tolerance=tolerance, spot_cs_map=_get_spot_map(raw)
                     )
-                    doc.update_stream(xref, updated)
+                    if updated != raw:
+                        doc.update_stream(xref, updated)
         except Exception:
             continue
 
@@ -596,6 +654,7 @@ def create_color_separated_docs(
     detected_colors: List[DetectedColor],
     separate_colors: bool = True,
     tolerance: float = 0.22,
+    in_place: bool = False,
 ) -> List[Tuple[DetectedColor, pymupdf.Document]]:
     """
     Given a source PDF document and its detected colors:
@@ -605,18 +664,18 @@ def create_color_separated_docs(
     - If `separate_colors=False` or `len(detected_colors) == 1`:
       Creates a single 100% vector PDF document where all non-white colors are converted
       to 100% Pure Grayscale Black (`0 g / 0 G`).
+      When `in_place=True`, monochromizes and returns `source_doc` directly without copying.
     Caller is responsible for closing the returned documents.
     """
-    pdf_bytes = source_doc.tobytes()
-
     if not separate_colors or len(detected_colors) <= 1:
-        mono_doc = pymupdf.open("pdf", pdf_bytes)
+        mono_doc = source_doc if in_place else pymupdf.open("pdf", source_doc.tobytes())
         _process_doc_streams(mono_doc, target_rgb=None, tolerance=tolerance)
         label_color = detected_colors[0] if detected_colors else DetectedColor(
             color_id=1, name="Qora (Black)", rgb=(0.0, 0.0, 0.0), hex_code="#000000"
         )
         return [(label_color, mono_doc)]
 
+    pdf_bytes = source_doc.tobytes()
     result: List[Tuple[DetectedColor, pymupdf.Document]] = []
     for col in detected_colors:
         chan_doc = pymupdf.open("pdf", pdf_bytes)
@@ -630,7 +689,7 @@ def enforce_and_audit_grayscale_black(doc: pymupdf.Document) -> GrayscaleAuditRe
     """
     Final Quality Control & Enforcement Module:
     1. Enforces 100% Pure Grayscale Black (`0 g` / `0 G` in DeviceGray) across all pages and XObjects.
-    2. Audits all vector drawings, text spans, and content streams to verify that every visible
+    2. Audits content streams (and drawings/text on single/small sheets) to verify that every visible
        non-white element is 100% Pure Black (0.0).
     """
     _process_doc_streams(doc, target_rgb=None)
@@ -640,31 +699,38 @@ def enforce_and_audit_grayscale_black(doc: pymupdf.Document) -> GrayscaleAuditRe
     remaining_color_ops = 0
     details: List[str] = []
 
+    # Fast exhaustive stream-level audit across all pages and Form XObjects
     for pno, page in enumerate(doc):
-        for d in page.get_drawings():
-            for key in ("color", "fill"):
-                rgb = normalize_color_to_rgb(d.get(key))
-                if rgb is not None and not is_white_rgb(rgb) and not is_black_rgb(rgb):
-                    non_black_drawings += 1
-                    details.append(f"Page {pno+1}: non-black drawing {key}={rgb}")
+        raw_stream = page.read_contents()
+        if _NON_GRAY_OP_BYTES_RE.search(raw_stream) is not None:
+            raw_text = raw_stream.decode("latin1", errors="ignore")
+            if re.search(r"\b(rg|RG|k|K)\b", raw_text):
+                remaining_color_ops += 1
 
-        text_dict = page.get_text("dict")
-        for b in text_dict.get("blocks", []):
-            if b.get("type") != 0:
-                continue
-            for line in b.get("lines", []):
-                for span in line.get("spans", []):
-                    if not (span.get("text") or "").strip():
-                        continue
-                    rgb = normalize_color_to_rgb(span.get("color"))
+    # On small/single-sticker docs, also run full PyMuPDF drawing & text span verification;
+    # on large combined multi-column sheets (e.g. 50-200 columns), skip get_drawings() which
+    # would allocate hundreds of thousands of Python dicts for already-monochromized XObjects.
+    if doc.xref_length() <= 150:
+        for pno, page in enumerate(doc):
+            for d in page.get_drawings():
+                for key in ("color", "fill"):
+                    rgb = normalize_color_to_rgb(d.get(key))
                     if rgb is not None and not is_white_rgb(rgb) and not is_black_rgb(rgb):
-                        non_black_texts += 1
-                        details.append(f"Page {pno+1}: non-black text '{span.get('text')}' color={rgb}")
+                        non_black_drawings += 1
+                        details.append(f"Page {pno+1}: non-black drawing {key}={rgb}")
 
-        # Check raw stream for any leftover rg/RG/k/K operators
-        raw_stream = page.read_contents().decode("latin1", errors="ignore")
-        if re.search(r"\b(rg|RG|k|K)\b", raw_stream):
-            remaining_color_ops += 1
+            text_dict = page.get_text("dict")
+            for b in text_dict.get("blocks", []):
+                if b.get("type") != 0:
+                    continue
+                for line in b.get("lines", []):
+                    for span in line.get("spans", []):
+                        if not (span.get("text") or "").strip():
+                            continue
+                        rgb = normalize_color_to_rgb(span.get("color"))
+                        if rgb is not None and not is_white_rgb(rgb) and not is_black_rgb(rgb):
+                            non_black_texts += 1
+                            details.append(f"Page {pno+1}: non-black text '{span.get('text')}' color={rgb}")
 
     passed = (non_black_drawings == 0) and (non_black_texts == 0) and (remaining_color_ops == 0)
     if passed:

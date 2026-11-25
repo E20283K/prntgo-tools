@@ -129,12 +129,14 @@ def _draw_regmark_on_page(
     col_width_mm: float,
     y_mm: float,
     config: ImpositionConfig,
+    shape: Optional[pymupdf.Shape] = None,
 ) -> None:
     """
     Draws a T-shaped regmark at vertical position `y_mm`:
     - Horizontal line of width `col_width_mm` (or `config.regmark_custom_width_mm`), thickness `0.2 mm`.
     - Vertical tick at horizontal center pointing DOWN by `0.7 mm`, thickness `0.2 mm`.
     - Drawn in 100% Grayscale Black (`color=(0,)`).
+    If `shape` is provided, appends to that shared Shape (caller finishes/commits once).
     """
     if not config.regmark_enabled:
         return
@@ -153,11 +155,16 @@ def _draw_regmark_on_page(
     xm_pt = mm_to_pt(center_x_mm)
     y_pt = mm_to_pt(y_mm)
 
-    shape = page.new_shape()
-    shape.draw_line(pymupdf.Point(x0_pt, y_pt), pymupdf.Point(x1_pt, y_pt))
-    shape.draw_line(pymupdf.Point(xm_pt, y_pt), pymupdf.Point(xm_pt, y_pt + tick_pt))
-    shape.finish(color=(0.0,), width=stroke_pt, lineCap=0)
-    shape.commit(overlay=True)
+    if shape is not None:
+        shape.draw_line(pymupdf.Point(x0_pt, y_pt), pymupdf.Point(x1_pt, y_pt))
+        shape.draw_line(pymupdf.Point(xm_pt, y_pt), pymupdf.Point(xm_pt, y_pt + tick_pt))
+        return
+
+    local_shape = page.new_shape()
+    local_shape.draw_line(pymupdf.Point(x0_pt, y_pt), pymupdf.Point(x1_pt, y_pt))
+    local_shape.draw_line(pymupdf.Point(xm_pt, y_pt), pymupdf.Point(xm_pt, y_pt + tick_pt))
+    local_shape.finish(color=(0.0,), width=stroke_pt, lineCap=0)
+    local_shape.commit(overlay=True)
 
 
 def build_imposed_pdf_from_columns(
@@ -198,6 +205,8 @@ def build_imposed_pdf_from_columns(
     except Exception:
         pass
 
+    regmark_shape = out_page.new_shape() if config.regmark_enabled else None
+
     cursor_x_mm = 0.0
     for col in columns:
         gm = col.gear_match
@@ -219,6 +228,9 @@ def build_imposed_pdf_from_columns(
         col_x0_pt = mm_to_pt(cursor_x_mm)
         col_x1_pt = mm_to_pt(cursor_x_mm + col.width_mm)
 
+        # PyMuPDF show_pdf_page `rotate` is counter-clockwise; convert from CW degrees
+        pymupdf_rotate = (-int(col.rotation_deg)) % 360
+
         for i in range(n_copies):
             slot_y0_mm = top_pad_mm + (i * slot_film_mm)
             design_y0_mm = slot_y0_mm + offset_film_mm
@@ -230,8 +242,6 @@ def build_imposed_pdf_from_columns(
                 col_x1_pt,
                 mm_to_pt(design_y1_mm),
             )
-            # PyMuPDF show_pdf_page `rotate` is counter-clockwise; convert from CW degrees
-            pymupdf_rotate = (-int(col.rotation_deg)) % 360
             out_page.show_pdf_page(
                 target_rect,
                 col.source_doc,
@@ -241,17 +251,23 @@ def build_imposed_pdf_from_columns(
                 overlay=True,
             )
 
-        for i in range(n_copies + 1):
-            boundary_y_mm = top_pad_mm + (i * slot_film_mm)
-            _draw_regmark_on_page(
-                out_page,
-                col_x0_mm=cursor_x_mm,
-                col_width_mm=col.width_mm,
-                y_mm=boundary_y_mm,
-                config=config,
-            )
+        if regmark_shape is not None:
+            for i in range(n_copies + 1):
+                boundary_y_mm = top_pad_mm + (i * slot_film_mm)
+                _draw_regmark_on_page(
+                    out_page,
+                    col_x0_mm=cursor_x_mm,
+                    col_width_mm=col.width_mm,
+                    y_mm=boundary_y_mm,
+                    config=config,
+                    shape=regmark_shape,
+                )
 
         cursor_x_mm += col.width_mm + gap_mm
+
+    if regmark_shape is not None:
+        regmark_shape.finish(color=(0.0,), width=mm_to_pt(config.regmark_stroke_mm), lineCap=0)
+        regmark_shape.commit(overlay=True)
 
     audit_report = enforce_and_audit_grayscale_black(out_doc)
     return out_doc, audit_report
@@ -265,11 +281,13 @@ def _ensure_corel_compatible_pdf(doc: pymupdf.Document) -> None:
     """
     for xref in range(1, doc.xref_length()):
         try:
-            obj = doc.xref_object(xref)
-            if "/Type /FontDescriptor" in obj and "/CapHeight" not in obj:
-                ascent_type, ascent_val = doc.xref_get_key(xref, "Ascent")
-                cap_h = ascent_val if (ascent_type in ("int", "float") and ascent_val) else "700"
-                doc.xref_set_key(xref, "CapHeight", str(cap_h))
+            t_type, t_val = doc.xref_get_key(xref, "Type")
+            if t_type == "name" and t_val == "/FontDescriptor":
+                ch_type, _ = doc.xref_get_key(xref, "CapHeight")
+                if ch_type == "null":
+                    ascent_type, ascent_val = doc.xref_get_key(xref, "Ascent")
+                    cap_h = ascent_val if (ascent_type in ("int", "float") and ascent_val) else "700"
+                    doc.xref_set_key(xref, "CapHeight", str(cap_h))
         except Exception:
             continue
 
@@ -283,7 +301,9 @@ def save_output_formats(
     """Saves the imposed vector PDF and optionally exports vector SVG and EPS files."""
     pdf_output_path.parent.mkdir(parents=True, exist_ok=True)
     _ensure_corel_compatible_pdf(doc)
-    doc.save(pdf_output_path, garbage=4, deflate=True)
+    # Use garbage=2 (O(N) xref compaction & dead-object removal) instead of garbage=4
+    # (O(N^2) stream byte comparison) which hangs for minutes on large multi-column sheets.
+    doc.save(pdf_output_path, garbage=2, deflate=True)
     saved: List[Path] = [pdf_output_path]
 
     if export_svg:
@@ -405,6 +425,7 @@ class ImpositionEngine:
         config: Optional[ImpositionConfig] = None,
         custom_gear: Optional[int] = None,
         custom_copies: Optional[int] = None,
+        src_doc: Optional[pymupdf.Document] = None,
     ) -> ImpositionItemResult:
         """Processes a single `PDFDesignInfo` (either a standalone file or 1 of N stickers on a sheet)."""
         cfg = config or ImpositionConfig()
@@ -422,65 +443,37 @@ class ImpositionEngine:
         )
 
         clean_doc, clip_rect = prepare_borderless_source_doc(
-            info.file_path, info=info, remove_border=cfg.remove_outer_border
+            info.file_path, info=info, remove_border=cfg.remove_outer_border, src_doc=src_doc
         )
+        separated_docs: List[Tuple[DetectedColor, pymupdf.Document]] = []
         try:
             detected_colors = detect_design_colors(clean_doc, clip_rect=clip_rect)
             separated_docs = create_color_separated_docs(
                 clean_doc,
                 detected_colors=detected_colors,
                 separate_colors=cfg.separate_colors,
+                in_place=True,
             )
-            try:
-                saved_files: List[Path] = []
-                last_audit: Optional[GrayscaleAuditReport] = None
-                stem = info.output_stem
+            saved_files: List[Path] = []
+            last_audit: Optional[GrayscaleAuditReport] = None
+            stem = info.output_stem
 
-                if cfg.color_output_mode == "separate_files" and len(separated_docs) > 1:
-                    for col_info, col_doc in separated_docs:
-                        safe_col = col_info.name.split()[0].lower()
-                        col_spec = StripColumnSpec(
-                            title=f"{stem}_{safe_col}",
-                            source_doc=col_doc,
-                            source_clip_rect_pt=clip_rect,
-                            width_mm=eff_width_mm,
-                            orig_length_mm=eff_length_mm,
-                            gear_match=gear_match,
-                            color_info=col_info,
-                            rotation_deg=rot_deg,
-                        )
-                        imposed_doc, audit = build_imposed_pdf_from_columns([col_spec], cfg)
-                        try:
-                            out_pdf = out_dir / f"{stem}_val{gear_match.gear}_film{gear_match.film_length_mm:.2f}mm_rang{col_info.color_id}_{safe_col}.pdf"
-                            saved_files.extend(
-                                save_output_formats(
-                                    imposed_doc,
-                                    out_pdf,
-                                    export_svg=cfg.export_svg,
-                                    export_eps=cfg.export_eps,
-                                )
-                            )
-                            last_audit = audit
-                        finally:
-                            imposed_doc.close()
-                else:
-                    columns = [
-                        StripColumnSpec(
-                            title=f"{stem}_{col_info.name}",
-                            source_doc=col_doc,
-                            source_clip_rect_pt=clip_rect,
-                            width_mm=eff_width_mm,
-                            orig_length_mm=eff_length_mm,
-                            gear_match=gear_match,
-                            color_info=col_info,
-                            rotation_deg=rot_deg,
-                        )
-                        for col_info, col_doc in separated_docs
-                    ]
-                    imposed_doc, audit = build_imposed_pdf_from_columns(columns, cfg)
+            if cfg.color_output_mode == "separate_files" and len(separated_docs) > 1:
+                for col_info, col_doc in separated_docs:
+                    safe_col = col_info.name.split()[0].lower()
+                    col_spec = StripColumnSpec(
+                        title=f"{stem}_{safe_col}",
+                        source_doc=col_doc,
+                        source_clip_rect_pt=clip_rect,
+                        width_mm=eff_width_mm,
+                        orig_length_mm=eff_length_mm,
+                        gear_match=gear_match,
+                        color_info=col_info,
+                        rotation_deg=rot_deg,
+                    )
+                    imposed_doc, audit = build_imposed_pdf_from_columns([col_spec], cfg)
                     try:
-                        color_tag = f"_{len(separated_docs)}rang" if len(separated_docs) > 1 else ""
-                        out_pdf = out_dir / f"{stem}_val{gear_match.gear}_film{gear_match.film_length_mm:.2f}mm{color_tag}.pdf"
+                        out_pdf = out_dir / f"{stem}_val{gear_match.gear}_film{gear_match.film_length_mm:.2f}mm_rang{col_info.color_id}_{safe_col}.pdf"
                         saved_files.extend(
                             save_output_formats(
                                 imposed_doc,
@@ -492,23 +485,55 @@ class ImpositionEngine:
                         last_audit = audit
                     finally:
                         imposed_doc.close()
+            else:
+                columns = [
+                    StripColumnSpec(
+                        title=f"{stem}_{col_info.name}",
+                        source_doc=col_doc,
+                        source_clip_rect_pt=clip_rect,
+                        width_mm=eff_width_mm,
+                        orig_length_mm=eff_length_mm,
+                        gear_match=gear_match,
+                        color_info=col_info,
+                        rotation_deg=rot_deg,
+                    )
+                    for col_info, col_doc in separated_docs
+                ]
+                imposed_doc, audit = build_imposed_pdf_from_columns(columns, cfg)
+                try:
+                    color_tag = f"_{len(separated_docs)}rang" if len(separated_docs) > 1 else ""
+                    out_pdf = out_dir / f"{stem}_val{gear_match.gear}_film{gear_match.film_length_mm:.2f}mm{color_tag}.pdf"
+                    saved_files.extend(
+                        save_output_formats(
+                            imposed_doc,
+                            out_pdf,
+                            export_svg=cfg.export_svg,
+                            export_eps=cfg.export_eps,
+                        )
+                    )
+                    last_audit = audit
+                finally:
+                    imposed_doc.close()
 
-                return ImpositionItemResult(
-                    input_path=info.file_path,
-                    design_info=info,
-                    gear_match=gear_match,
-                    detected_colors=detected_colors,
-                    output_files=saved_files,
-                    audit_report=last_audit,
-                    effective_width_mm=eff_width_mm,
-                    effective_length_mm=eff_length_mm,
-                    rotation_deg=rot_deg,
-                )
-            finally:
-                for _, d in separated_docs:
-                    d.close()
+            return ImpositionItemResult(
+                input_path=info.file_path,
+                design_info=info,
+                gear_match=gear_match,
+                detected_colors=detected_colors,
+                output_files=saved_files,
+                audit_report=last_audit,
+                effective_width_mm=eff_width_mm,
+                effective_length_mm=eff_length_mm,
+                rotation_deg=rot_deg,
+            )
         finally:
-            clean_doc.close()
+            closed_ids: set[int] = set()
+            for _, d in separated_docs:
+                if id(d) not in closed_ids:
+                    closed_ids.add(id(d))
+                    d.close()
+            if id(clean_doc) not in closed_ids:
+                clean_doc.close()
 
     def process_single_file(
         self,
@@ -553,16 +578,21 @@ class ImpositionEngine:
         custom_copies: Optional[int] = None,
     ) -> List[ImpositionItemResult]:
         designs = inspect_pdf_designs(pdf_path)
-        return [
-            self.process_design_info(
-                d,
-                output_dir=output_dir,
-                config=config,
-                custom_gear=custom_gear,
-                custom_copies=custom_copies,
-            )
-            for d in designs
-        ]
+        src_doc = pymupdf.open(pdf_path)
+        try:
+            return [
+                self.process_design_info(
+                    d,
+                    output_dir=output_dir,
+                    config=config,
+                    custom_gear=custom_gear,
+                    custom_copies=custom_copies,
+                    src_doc=src_doc,
+                )
+                for d in designs
+            ]
+        finally:
+            src_doc.close()
 
     def process_batch_combined_by_gear(
         self,
@@ -596,11 +626,16 @@ class ImpositionEngine:
             if progress_callback is not None:
                 progress_callback(min(current_step, total_steps), total_steps, msg)
 
-        grouped: Dict[int, List[Tuple[PDFDesignInfo, GearMatch, List[DetectedColor], pymupdf.Document, pymupdf.Rect]]] = {}
+        grouped: Dict[int, List[Tuple[PDFDesignInfo, GearMatch, float, float, int]]] = {}
         results_map: Dict[str, ImpositionItemResult] = {}
-        all_clean_docs: List[pymupdf.Document] = []
+        src_docs: Dict[Path, pymupdf.Document] = {}
 
         try:
+            # Open each unique source PDF once instead of reopening per page/design
+            for info in design_infos:
+                if info.file_path not in src_docs:
+                    src_docs[info.file_path] = pymupdf.open(info.file_path)
+
             for idx, info in enumerate(design_infos, start=1):
                 current_step += 1
                 report(f"[{idx}/{total_items}] Tahlil qilinmoqda: {info.display_name}...")
@@ -614,17 +649,12 @@ class ImpositionEngine:
                     custom_copies=c_copies,
                     custom_gear=c_gear,
                 )
-                clean_doc, clip_rect = prepare_borderless_source_doc(
-                    info.file_path, info=info, remove_border=cfg.remove_outer_border
-                )
-                all_clean_docs.append(clean_doc)
-                cols = detect_design_colors(clean_doc, clip_rect=clip_rect)
-                grouped.setdefault(match.gear, []).append((info, match, cols, clean_doc, clip_rect))
+                grouped.setdefault(match.gear, []).append((info, match, eff_w, eff_l, rot_deg))
                 results_map[key] = ImpositionItemResult(
                     input_path=info.file_path,
                     design_info=info,
                     gear_match=match,
-                    detected_colors=cols,
+                    detected_colors=[],
                     effective_width_mm=eff_w,
                     effective_length_mm=eff_l,
                     rotation_deg=rot_deg,
@@ -634,15 +664,27 @@ class ImpositionEngine:
                 open_docs: List[pymupdf.Document] = []
                 try:
                     all_cols_with_owner: List[Tuple[str, StripColumnSpec]] = []
-                    for info, match, cols, clean_doc, clip_rect in group_items:
+                    for info, match, eff_w, eff_l, rot_deg in group_items:
                         current_step += 1
                         report(f"{gear_num} val uchun rang va hoshiya tayyorlanmoqda: {info.display_name}...")
-                        eff_w, eff_l, rot_deg = resolve_design_orientation(
-                            info.width_mm, info.length_mm, cfg.rotation_mode
+                        clean_doc, clip_rect = prepare_borderless_source_doc(
+                            info.file_path,
+                            info=info,
+                            remove_border=cfg.remove_outer_border,
+                            src_doc=src_docs[info.file_path],
                         )
+                        cols = detect_design_colors(clean_doc, clip_rect=clip_rect)
+                        results_map[info.item_key].detected_colors = cols
                         sep_docs = create_color_separated_docs(
-                            clean_doc, detected_colors=cols, separate_colors=cfg.separate_colors
+                            clean_doc,
+                            detected_colors=cols,
+                            separate_colors=cfg.separate_colors,
+                            in_place=True,
                         )
+                        reused_clean = any(d is clean_doc for _, d in sep_docs)
+                        if not reused_clean:
+                            clean_doc.close()
+
                         for col_info, col_doc in sep_docs:
                             open_docs.append(col_doc)
                             all_cols_with_owner.append(
@@ -713,7 +755,7 @@ class ImpositionEngine:
                         except Exception:
                             pass
         finally:
-            for d in all_clean_docs:
+            for d in src_docs.values():
                 try:
                     d.close()
                 except Exception:
