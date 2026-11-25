@@ -601,10 +601,13 @@ class ImpositionEngine:
         config: Optional[ImpositionConfig] = None,
         overrides: Optional[Dict[str, Tuple[Optional[int], Optional[int]]]] = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        group_by_file: bool = False,
     ) -> List[ImpositionItemResult]:
         """
         Groups multiple sticker designs (across multiple files OR 26 stickers extracted from 1 sheet)
         that match the SAME Gear (val) and places their columns side-by-side onto combined cylinder PDF(s).
+        When `group_by_file=True`, designs are grouped by `(source_file, gear)` so each uploaded file
+        produces its own separate imposed PDF(s) named after that file.
         """
         cfg = config or ImpositionConfig()
         out_dir = Path(output_dir)
@@ -626,7 +629,7 @@ class ImpositionEngine:
             if progress_callback is not None:
                 progress_callback(min(current_step, total_steps), total_steps, msg)
 
-        grouped: Dict[int, List[Tuple[PDFDesignInfo, GearMatch, float, float, int]]] = {}
+        grouped: Dict[Tuple[Optional[Path], int], List[Tuple[PDFDesignInfo, GearMatch, float, float, int]]] = {}
         results_map: Dict[str, ImpositionItemResult] = {}
         src_docs: Dict[Path, pymupdf.Document] = {}
 
@@ -649,7 +652,8 @@ class ImpositionEngine:
                     custom_copies=c_copies,
                     custom_gear=c_gear,
                 )
-                grouped.setdefault(match.gear, []).append((info, match, eff_w, eff_l, rot_deg))
+                group_key = (info.file_path if group_by_file else None, match.gear)
+                grouped.setdefault(group_key, []).append((info, match, eff_w, eff_l, rot_deg))
                 results_map[key] = ImpositionItemResult(
                     input_path=info.file_path,
                     design_info=info,
@@ -660,7 +664,7 @@ class ImpositionEngine:
                     rotation_deg=rot_deg,
                 )
 
-            for gear_num, group_items in grouped.items():
+            for (group_file, gear_num), group_items in grouped.items():
                 open_docs: List[pymupdf.Document] = []
                 try:
                     all_cols_with_owner: List[Tuple[str, StripColumnSpec]] = []
@@ -730,10 +734,13 @@ class ImpositionEngine:
                         imposed_doc, audit = build_imposed_pdf_from_columns(batch_specs, cfg)
                         try:
                             suffix = f"_part{b_idx}" if len(batches) > 1 else ""
-                            names_tag = "_".join(
-                                dict.fromkeys(results_map[k].design_info.output_stem for k, _ in batch)
-                            )[:40]
-                            out_pdf = out_dir / f"combined_val{gear_num}_film{film_len:.2f}mm_{names_tag}{suffix}.pdf"
+                            if group_file is not None:
+                                out_pdf = out_dir / f"{group_file.stem}_val{gear_num}_film{film_len:.2f}mm{suffix}.pdf"
+                            else:
+                                names_tag = "_".join(
+                                    dict.fromkeys(results_map[k].design_info.output_stem for k, _ in batch)
+                                )[:40]
+                                out_pdf = out_dir / f"combined_val{gear_num}_film{film_len:.2f}mm_{names_tag}{suffix}.pdf"
                             saved = save_output_formats(
                                 imposed_doc,
                                 out_pdf,

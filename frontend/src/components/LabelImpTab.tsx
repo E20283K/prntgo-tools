@@ -97,6 +97,7 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
   const [rotationMode, setRotationMode] = useState("auto")
   const [colorMode, setColorMode] = useState("side_by_side")
   const [combineGear, setCombineGear] = useState(true)
+  const [separateByFile, setSeparateByFile] = useState(false)
   const [separateColors, setSeparateColors] = useState(true)
   const [removeBorder, setRemoveBorder] = useState(true)
   const [regmark, setRegmark] = useState(true)
@@ -188,6 +189,7 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
     if (customCopies.trim()) fd.append("custom_copies", customCopies.trim())
     fd.append("rotation_mode", rotationMode)
     fd.append("combine_same_gear", String(combineGear))
+    fd.append("separate_by_file", String(separateByFile))
     fd.append("separate_colors", String(separateColors))
     fd.append("color_output_mode", colorMode)
     fd.append("remove_outer_border", String(removeBorder))
@@ -233,6 +235,7 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
     customCopies,
     rotationMode,
     combineGear,
+    separateByFile,
     separateColors,
     colorMode,
     removeBorder,
@@ -312,6 +315,7 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
       if (customCopies.trim()) fd.append("custom_copies", customCopies.trim())
       fd.append("rotation_mode", rotationMode)
       fd.append("combine_same_gear", String(combineGear))
+      fd.append("separate_by_file", String(separateByFile))
       fd.append("separate_colors", String(separateColors))
       fd.append("color_output_mode", colorMode)
       fd.append("remove_outer_border", String(removeBorder))
@@ -626,6 +630,26 @@ export function LabelImpTab({ handoff, onClearHandoff }: LabelImpTabProps) {
                   id="labelCombineGear"
                   checked={combineGear}
                   onCheckedChange={setCombineGear}
+                />
+              </div>
+
+              <div className="flex items-center justify-between gap-4 py-3">
+                <div className="space-y-0.5">
+                  <Label
+                    htmlFor="labelSeparateByFile"
+                    className={!combineGear ? "text-muted-foreground" : undefined}
+                  >
+                    Har bir faylni alohida montaj qilish
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    Har bir yuklangan PDF fayl o'z nomi bilan alohida montaj qilinadi
+                  </p>
+                </div>
+                <Switch
+                  id="labelSeparateByFile"
+                  checked={separateByFile}
+                  disabled={!combineGear}
+                  onCheckedChange={setSeparateByFile}
                 />
               </div>
 

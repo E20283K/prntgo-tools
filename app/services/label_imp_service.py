@@ -177,6 +177,7 @@ def preview_label_imposition_pdf(
     custom_copies: Optional[int] = None,
     rotation_mode: str = "auto",
     combine_same_gear: bool = True,
+    separate_by_file: bool = False,
     separate_colors: bool = True,
     color_output_mode: str = "side_by_side",
     remove_outer_border: bool = True,
@@ -258,6 +259,7 @@ def preview_label_imposition_pdf(
                 output_dir=outputs_dir,
                 config=config,
                 overrides=overrides,
+                group_by_file=separate_by_file,
             )
         else:
             results = []
@@ -324,6 +326,7 @@ def run_label_imposition_job(
     custom_copies: Optional[int] = None,
     rotation_mode: str = "auto",
     combine_same_gear: bool = True,
+    separate_by_file: bool = False,
     separate_colors: bool = True,
     color_output_mode: str = "side_by_side",
     remove_outer_border: bool = True,
@@ -348,11 +351,13 @@ def run_label_imposition_job(
         shutil.copy2(src, dst)
         input_paths.append(dst)
 
-    for fname, raw in (uploaded_files or []):
+    for idx, (fname, raw) in enumerate(uploaded_files or [], start=1):
         safe = Path(fname).name
         if not safe.lower().endswith(".pdf"):
             continue
         dst = inputs_dir / safe
+        if dst.exists():
+            dst = inputs_dir / f"{dst.stem}_{idx}{dst.suffix}"
         dst.write_bytes(raw)
         input_paths.append(dst)
 
@@ -384,6 +389,7 @@ def run_label_imposition_job(
             output_dir=outputs_dir,
             config=config,
             overrides=overrides,
+            group_by_file=separate_by_file,
         )
     else:
         results = []
